@@ -23,6 +23,7 @@ classifiers = [
 # called as a subprocess.
 dependencies = [
     "numpy>=1.24",
+    "pyyaml>=6",
 ]
 
 [project.scripts]
@@ -33,10 +34,14 @@ li-deploy-session    = "lerobot_isaac_deploy.cli:session_main"
 li-deploy-sync-ckpt  = "lerobot_isaac_deploy.cli:sync_ckpt_main"
 li-deploy-sync-eval  = "lerobot_isaac_deploy.cli:sync_eval_main"
 li-deploy-bootstrap  = "lerobot_isaac_deploy.cli:bootstrap_main"
+li-deploy-wm-rollout = "lerobot_isaac_deploy.cli:wm_rollout_main"
+li-deploy-kind       = "lerobot_isaac_deploy.cli:kind_main"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
 runner = ["robot-data-runner>=0.1.0"]
+dreamerv3 = ["sheeprl>=0.5", "torch>=2.0"]
+lewm = ["lerobot>=0.5", "torch>=2.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lerobot_isaac_deploy"]

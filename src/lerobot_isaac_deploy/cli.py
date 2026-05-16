@@ -66,15 +66,36 @@ def bootstrap_main(argv: list[str] | None = None) -> int:
     return _bootstrap(argv)
 
 
+def wm_rollout_main(argv: list[str] | None = None) -> int:
+    from lerobot_isaac_deploy.wm_rollout import main as _rollout
+
+    return _rollout(argv)
+
+
+def kind_main(argv: list[str] | None = None) -> int:
+    """`lerobot-isaac-deploy kind <PATH>` — print detected ckpt kind."""
+    import sys
+    from lerobot_isaac_deploy.policy_kind import detect_policy_kind, explain
+
+    if not argv:
+        print("usage: lerobot-isaac-deploy kind <CHECKPOINT_DIR>", file=sys.stderr)
+        return 2
+    kind = detect_policy_kind(argv[0])
+    print(f"{kind}\t{explain(kind)}")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # Umbrella entry
 # --------------------------------------------------------------------------- #
 
 _SUBCOMMANDS = {
-    "session":    (session_main,   "Run the confirm-gated deploy ladder"),
-    "sync-ckpt":  (sync_ckpt_main, "Desktop → laptop ckpt sync (run on desktop)"),
-    "sync-eval":  (sync_eval_main, "Laptop → desktop eval JSON pull (run on desktop)"),
-    "bootstrap":  (bootstrap_main, "One-shot laptop env setup"),
+    "session":    (session_main,    "Run the confirm-gated deploy ladder (LeRobot or DreamerV3-actor)"),
+    "wm-rollout": (wm_rollout_main, "Offline state-prediction rollout (DreamerV3 / LeWM); no robot"),
+    "kind":       (kind_main,       "Detect what kind of checkpoint a directory holds"),
+    "sync-ckpt":  (sync_ckpt_main,  "Desktop → laptop ckpt sync (run on desktop)"),
+    "sync-eval":  (sync_eval_main,  "Laptop → desktop eval JSON pull (run on desktop)"),
+    "bootstrap":  (bootstrap_main,  "One-shot laptop env setup"),
 }
 
 

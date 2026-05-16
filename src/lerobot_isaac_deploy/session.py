@@ -138,6 +138,40 @@ class DeploySession:
                 f"dataset_root not a directory: {self.cfg.dataset_root}"
             )
 
+        # Checkpoint-kind gate. The session's confirm-gated ladder routes
+        # through robot-data-runner's CLI which loads via the lerobot
+        # policy factory only. WM checkpoints need separate paths.
+        from lerobot_isaac_deploy.policy_kind import detect_policy_kind, explain
+        kind = detect_policy_kind(self.cfg.policy_path)
+        info(f"detected policy kind: {kind} — {explain(kind)}")
+        if kind == "lerobot":
+            return
+        if kind == "dreamerv3":
+            raise RuntimeError(
+                "DreamerV3 deploy via the LeRobot CLI ladder is not yet "
+                "wired. The actor is loadable via "
+                "lerobot_isaac_deploy.wm_loader.load_dreamerv3, but the "
+                "robot-data-runner subprocess assumes a LeRobot policy "
+                "factory checkpoint. Either:\n"
+                "  • train a LeRobot policy (smolvla/act/diffusion) on the "
+                "same task and deploy that, OR\n"
+                "  • use `lerobot-isaac-deploy wm-rollout` for offline "
+                "dream-rollout (no motors), OR\n"
+                "  • wait for the in-process dreamer-actor deploy path "
+                "(see plans/2026-05-16-dreamer-actor-deploy.md)."
+            )
+        if kind == "lewm":
+            raise RuntimeError(
+                "LeWorldModel checkpoints have no actor head. Use "
+                "`lerobot-isaac-deploy wm-rollout` for offline rollouts. "
+                "For real-robot control on this task, deploy a LeRobot "
+                "policy trained on the same dataset."
+            )
+        raise RuntimeError(
+            f"could not detect checkpoint kind at {self.cfg.policy_path}; "
+            f"expected lerobot / dreamerv3 / lewm shape"
+        )
+
     def write_safety_ack(self) -> None:
         """Create the one-time safety-ack marker so the eval CLI doesn't block."""
         self.safety_ack.parent.mkdir(parents=True, exist_ok=True)
@@ -290,6 +324,10 @@ class DeploySession:
         except FileNotFoundError as exc:
             err(str(exc))
             return 2
+        except RuntimeError as exc:
+            # Checkpoint-kind gate refused with an actionable hint.
+            err(str(exc))
+            return 1
 
         info("laptop deploy session")
         info(f"  policy-path : {self.cfg.policy_path}")
