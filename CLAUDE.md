@@ -8,13 +8,26 @@ confirm-gated state machine.
 **Working tree:** `~/workspaces/spinouts/lerobot_isaac_deploy/` (NOT a
 bare repo — matches `robot_data_runner` and `robot_data_recorder`).
 
-**Install:**
+**Install (pixi, recommended for laptop):**
 
 ```bash
-pip install lerobot-isaac-deploy[runner]
-# or on the laptop, one-shot:
+git clone https://github.com/kvgork/lerobot-isaac-deploy.git
+cd lerobot-isaac-deploy
+pixi install          # python + lerobot==0.5.1[smolvla] + robot-data-runner + this pkg
+pixi run bootstrap    # workspace dirs + SmolVLM2-500M weight prefetch
+```
+
+**Install (pip alternative):**
+
+```bash
+pip install "lerobot-isaac-deploy[runner]"
 li-deploy-bootstrap
 ```
+
+**Why pixi:** matches the `lerobot-isaac-*` family pattern (the 6 bare-repo
+siblings all carry an active `pixi.toml`). Pinned reproducible env on
+the laptop, conda-managed system deps (`rsync`), pip-managed python deps
+(lerobot pinned to 0.5.1 to match the desktop training env).
 
 ---
 

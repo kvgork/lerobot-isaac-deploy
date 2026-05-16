@@ -27,16 +27,29 @@ lerobot-isaac-deploy session \
 
 ## Install
 
+**Recommended (pixi, fresh laptop):**
+
 ```bash
-pip install lerobot-isaac-deploy
-# pulls robot-data-runner via the [runner] extra
-pip install "lerobot-isaac-deploy[runner]"
+git clone https://github.com/kvgork/lerobot-isaac-deploy.git
+cd lerobot-isaac-deploy
+pixi install                  # installs python + lerobot + robot-data-runner + this pkg
+pixi run bootstrap            # prefetches SmolVLM2-500M (~6.7 GB) + workspace dirs
 ```
 
-Or for a fresh laptop:
+**Alt (pip into an existing venv):**
 
 ```bash
+pip install "lerobot-isaac-deploy[runner]"
 li-deploy-bootstrap
+```
+
+**Pixi task shortcuts:**
+
+```bash
+pixi run session -- --winner /path/to/winner.json --execute
+pixi run sync-ckpt -- --run-dir outputs/overnight-smolvla-<ts>-anchor
+pixi run sync-eval
+pixi run test
 ```
 
 ## Subcommands

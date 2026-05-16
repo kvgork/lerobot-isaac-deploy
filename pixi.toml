@@ -1,0 +1,49 @@
+# lerobot-isaac-deploy/pixi.toml
+# Active in standalone mode (this directory is a spun-out working tree).
+# On the laptop, `pixi install` is the one-shot bootstrap — replaces the
+# old laptop_bootstrap.sh from the training workspace.
+
+[workspace]
+name = "lerobot-isaac-deploy"
+channels = ["conda-forge", "pytorch", "nvidia"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.10,<3.13"
+pip = "*"
+numpy = ">=1.24"
+rsync = "*"
+
+[pypi-dependencies]
+# Editable install of THIS package so console scripts get registered.
+lerobot-isaac-deploy = { path = ".", editable = true }
+# Sibling runner CLIs we orchestrate via subprocess.
+robot-data-runner = "*"
+# Pinned to match the desktop training env (see CLAUDE.md of the training repo).
+lerobot = { version = "==0.5.1", extras = ["smolvla"] }
+
+[feature.test.dependencies]
+pytest = ">=7"
+
+[feature.test.tasks]
+test = "pytest tests/ -v"
+
+# --- Operator-facing tasks --------------------------------------------------
+[tasks]
+# One-shot setup: ensure workspace dirs + prefetch SmolVLM2 weights.
+bootstrap = "li-deploy-bootstrap"
+
+# Pre-fetch HF weights only (no pip install).
+prefetch-weights = "li-deploy-bootstrap --skip-pip"
+
+# Show CLI help.
+help = "lerobot-isaac-deploy --help"
+
+# Convenience shortcuts (pass extra args through):
+#   pixi run session -- --winner /path/to/winner.json --execute
+session    = "li-deploy-session"
+sync-ckpt  = "li-deploy-sync-ckpt"
+sync-eval  = "li-deploy-sync-eval"
+
+[environments]
+default = { features = ["test"], solve-group = "default" }
