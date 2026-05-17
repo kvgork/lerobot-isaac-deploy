@@ -92,7 +92,7 @@ the combination early (exit 1).
 | Command             | Runs on   | What it does |
 |---------------------|-----------|--------------|
 | `li-deploy-session` | laptop    | Confirm-gated dry → 1° → 3° → eval ladder |
-| `li-deploy-sync-ckpt` | desktop | rsync ckpt → laptop |
+| `li-deploy-sync-ckpt` | desktop | rsync ckpt (+ optional dataset) → laptop |
 | `li-deploy-sync-eval` | desktop | rsync eval JSONs ← laptop |
 | `li-deploy-bootstrap` | laptop  | One-shot env + weight prefetch |
 
@@ -120,30 +120,52 @@ The fast path from "autoresearch sweep finished on desktop" to
 ```bash
 # === DESKTOP (one command) ===
 cd ~/workspaces/lerobot-isaac-deploy
-pixi run sync-winner            # find newest winner.json, rsync ckpt + rewritten JSON
+pixi run sync-winner            # rsync ckpt + dataset + rewritten winner.json
 # logs:
 #   [sync-winner] /home/.../outputs/eval/<latest>-rerank/winner.json
+#   [sync-winner] dataset → /home/.../datasets/kvgork/so101-pickplace1
 #   [sync] $ ssh laptop mkdir -p ~/workspaces/lerobot-isaac-deploy/models/<run>/<ckpt>/pretrained_model
 #   [sync] $ rsync … pretrained_model/ → laptop:…/models/<run>/<ckpt>/pretrained_model/
+#   [sync] $ ssh laptop mkdir -p ~/workspaces/lerobot-isaac-deploy/datasets/<dataset>
+#   [sync] $ rsync … <dataset>/ → laptop:…/datasets/<dataset>/
 #   [sync] wrote laptop winner.json → …/models/<run>/winner.json
-#          (policy_path rewritten to laptop-local path)
+#          (policy_path rewritten + dataset_root added)
 
 # === LAPTOP — smoke test the loaded model first (no motors) ===
 cd ~/workspaces/lerobot-isaac-deploy
 pixi run deploy-winner -- --dry-run-loop --yes
 # Loads the synced ckpt, runs the inference loop, prints actions, NO motor writes.
+# `--dataset-root` is NOT needed — the rewritten winner.json carries it.
 
 # === LAPTOP — drive the SO-101 ===
 pixi run deploy-winner -- --execute      # confirm-gated 1° → 3° → 10-ep eval
 ```
 
-`sync-winner` ships both the model AND a rewritten `winner.json`
-sitting next to it. `deploy-winner` finds the newest such file under
-`models/*/winner.json` and hands it to the confirm-gated session ladder.
+`sync-winner` ships THREE things in one go:
 
-The session reads `winner_policy_path` from the *rewritten* JSON, which
-now resolves correctly on the laptop. The original desktop winner.json
-is preserved at `_source_winner_json` for traceability.
+1. The latest `pretrained_model/` checkpoint → `models/<run>/<ckpt>/pretrained_model/`.
+2. The LeRobotDataset the ckpt was trained on → `datasets/<basename>/`.
+   The path is read from `.agent-state/<base>-ar/autoresearch/<slug>/program.json`
+   on the desktop. If `program.json` cannot be found, the dataset rsync is
+   skipped with a warning (operator may have already shipped it).
+3. A rewritten `winner.json` next to the ckpt, with:
+   * `winner_policy_path` pointing at the laptop-local ckpt.
+   * `dataset_root` pointing at the laptop-local dataset.
+   * `_source_winner_json` preserving the desktop original for traceability.
+
+`deploy-winner` finds the newest `models/*/winner.json` and hands it to
+the confirm-gated session ladder. The session reads BOTH
+`winner_policy_path` and `dataset_root` from the rewritten JSON, so no
+manual `--dataset-root` flag is needed.
+
+### Dataset-root precedence
+
+`session.py` resolves `--dataset-root` in this order:
+
+1. Explicit `--dataset-root` flag (highest).
+2. `dataset_root` field in `--winner` JSON.
+3. `LEROBOT_ISAAC_DEPLOY_DATASET_ROOT` env var.
+4. Hardcoded fallback `<deploy>/datasets/so101-pickplace1`.
 
 After motors have moved:
 
@@ -162,6 +184,20 @@ pixi run sync-eval
   (needed by `sync-winner`).
 * SO-101 plugged in at `/dev/ttyACM0`, camera at `/dev/video0`
   (override via `--port` / `--camera`).
+
+## On-disk layout
+
+```
+~/workspaces/lerobot-isaac-deploy/
+├── models/<run>/<ckpt>/pretrained_model/    ← synced by sync-winner
+├── models/<run>/winner.json                  ← rewritten, carries dataset_root
+├── datasets/<basename>/                      ← synced by sync-winner
+└── outputs/eval/*.json                       ← produced by session step 5
+```
+
+`models/` and `datasets/` are tracked-but-empty: only `README.md` +
+`.gitignore` are committed. Every actual checkpoint / Parquet chunk is
+gitignored.
 
 ## Safety contract
 
