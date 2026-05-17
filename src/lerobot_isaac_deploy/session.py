@@ -5,12 +5,34 @@ Steps:
 
     1. preflight                robot-data-run-check   (no robot)
     2. dry-run loop             robot-data-run          (robot, no motors)
+       (or in-process mock loop when ``--mock-hardware`` is set)
     3. execute @ 1°/step        robot-data-run --execute
     4. execute @ 3°/step        robot-data-run --execute
     5. closed-loop N-ep eval    robot-data-run-eval
 
 Each step prompts stdin for ``yes`` before advancing. Operator aborts
 at any step → graceful exit code 10.
+
+Non-interactive mode
+--------------------
+Pass ``--yes`` / ``--assume-yes`` (or set
+``LEROBOT_ISAAC_DEPLOY_ASSUME_YES=1``) to auto-answer "yes" to confirm
+prompts. As a defense-in-depth measure, ``--yes`` alone NEVER
+auto-confirms a step that sends motor commands (the two ``--execute``
+steps). Operators must pass BOTH ``--yes`` AND ``--execute`` to
+auto-advance through motor-write gates — this preserves a typed gate
+between the smoke-test path and any real-hardware path.
+
+Mock-hardware mode
+------------------
+Pass ``--mock-hardware`` to skip the ``robot-data-run`` subprocess in
+step 2 and instead run an in-process inference loop with synthetic
+observations. The policy is loaded via ``robot-data-runner``'s
+``load_policy`` (proven by preflight), then fed zero-valued state and
+image observations matching ``policy.config.input_features``. Useful
+for verifying end-to-end inference on a desktop with no SO-101 plugged
+in. Mock-hardware is incompatible with ``--execute`` and the
+closed-loop eval — those paths require real hardware.
 """
 
 from __future__ import annotations
@@ -50,6 +72,8 @@ class SessionConfig:
     do_dry_loop: bool = False
     do_execute: bool = False
     skip_closed_loop: bool = False
+    assume_yes: bool = False
+    mock_hardware: bool = False
     eval_output_dir: Path = field(
         default_factory=lambda: Path.home() / "outputs" / "eval"
     )
@@ -69,6 +93,14 @@ _RED = "\033[0;31m"
 _CYAN = "\033[0;36m"
 _YELLOW = "\033[1;33m"
 _NC = "\033[0m"
+
+_TRUTHY = {"1", "true", "yes", "on", "y", "t"}
+
+
+def _env_assume_yes() -> bool:
+    """Honor ``LEROBOT_ISAAC_DEPLOY_ASSUME_YES`` (case-insensitive truthy)."""
+    val = os.environ.get("LEROBOT_ISAAC_DEPLOY_ASSUME_YES", "").strip().lower()
+    return val in _TRUTHY
 
 
 def _stamp() -> str:
@@ -91,9 +123,40 @@ def err(msg: str) -> None:
     print(f"{_RED}[{_stamp()} ERR ]{_NC} {msg}", file=sys.stderr, flush=True)
 
 
-def confirm(msg: str) -> None:
-    """Read 'yes' from stdin or abort the session with exit 10."""
-    ans = input(f"{_YELLOW}{msg} [type 'yes' to continue]:{_NC} ").strip().lower()
+def confirm(
+    msg: str,
+    *,
+    auto_yes: bool = False,
+    safety_critical: bool = False,
+) -> None:
+    """Read 'yes' from stdin or abort the session with exit 10.
+
+    When ``auto_yes`` is True AND ``safety_critical`` is False, the prompt
+    is auto-answered (the question is still printed for the operator log,
+    tagged ``[auto-yes]``).
+
+    When ``safety_critical=True`` the auto-yes path is refused — the prompt
+    always blocks on stdin. This is the defense-in-depth gate guarding
+    motor-write steps: even with ``--yes`` set, the operator must
+    explicitly type ``yes`` (or pass the dedicated motor-write flag,
+    which the caller decides) before motors move.
+    """
+    if auto_yes and not safety_critical:
+        print(
+            f"{_YELLOW}{msg} [auto-yes]{_NC}",
+            flush=True,
+        )
+        return
+    try:
+        ans = input(
+            f"{_YELLOW}{msg} [type 'yes' to continue]:{_NC} "
+        ).strip().lower()
+    except EOFError:
+        err(
+            f"stdin closed at: {msg}. "
+            "Pass --yes / --assume-yes for non-interactive runs."
+        )
+        sys.exit(10)
     if ans != "yes":
         err(f"operator aborted at: {msg}")
         sys.exit(10)
@@ -138,6 +201,15 @@ class DeploySession:
                 f"dataset_root not a directory: {self.cfg.dataset_root}"
             )
 
+        # Mock-hardware is incompatible with motor-write paths. We reject
+        # the combination early so the operator gets a clear error rather
+        # than a surprise later in the ladder.
+        if self.cfg.mock_hardware and self.cfg.do_execute:
+            raise RuntimeError(
+                "--mock-hardware is a no-motor smoke path and cannot be "
+                "combined with --execute. Drop one of the two flags."
+            )
+
         # Checkpoint-kind gate. The session's confirm-gated ladder routes
         # through robot-data-runner's CLI which loads via the lerobot
         # policy factory only. WM checkpoints need separate paths.
@@ -180,6 +252,14 @@ class DeploySession:
 
     # ----- ladder steps ------------------------------------------------- #
 
+    def _confirm(self, msg: str, *, safety_critical: bool = False) -> None:
+        """Session-scoped confirm honoring ``cfg.assume_yes``."""
+        confirm(
+            msg,
+            auto_yes=self.cfg.assume_yes,
+            safety_critical=safety_critical,
+        )
+
     def step_preflight(self) -> None:
         info("STEP 1: preflight (load policy + I/O schema, no motors)")
         check = self._find_runner_bin("robot-data-run-check")
@@ -196,7 +276,25 @@ class DeploySession:
         ok("policy loads cleanly")
 
     def step_dry_loop(self) -> None:
-        confirm(
+        if self.cfg.mock_hardware:
+            self._confirm(
+                "Run MOCK-HARDWARE inference loop "
+                "(no serial port, no camera, synthetic obs)?"
+            )
+            info(
+                f"STEP 2 (mock): in-process synthetic-obs inference "
+                f"({self.cfg.duration_dry_s:.0f}s @ {self.cfg.rate_hz:.0f} Hz)"
+            )
+            from lerobot_isaac_deploy.mock_hardware import (
+                run_mock_inference_loop,
+            )
+            rc = run_mock_inference_loop(self.cfg)
+            if rc != 0:
+                raise RuntimeError(f"mock-hardware loop failed rc={rc}")
+            ok("mock-hardware loop complete — policy emits actions end-to-end")
+            return
+
+        self._confirm(
             f"SO-101 plugged in at {self.cfg.port}? Workspace clear?"
         )
         info(f"STEP 2: dry-run loop ({self.cfg.duration_dry_s:.0f}s, NO motor writes)")
@@ -209,9 +307,10 @@ class DeploySession:
         ok("dry-run complete — verify action lines made sense")
 
     def step_execute_tight(self) -> None:
-        confirm(
+        self._confirm(
             f"READY for tight execute? Hand on e-stop. "
-            f"{self.cfg.clamp_tight_deg}°/step, {self.cfg.duration_tight_s:.0f}s."
+            f"{self.cfg.clamp_tight_deg}°/step, {self.cfg.duration_tight_s:.0f}s.",
+            safety_critical=True,
         )
         info(
             f"STEP 3: execute @ {self.cfg.clamp_tight_deg}° clamp, "
@@ -233,9 +332,10 @@ class DeploySession:
         ok("tight execute complete — abort here if motion looked wrong")
 
     def step_execute_loose(self) -> None:
-        confirm(
+        self._confirm(
             f"Step 3 OK. Proceed to {self.cfg.clamp_loose_deg}°/step, "
-            f"{self.cfg.duration_loose_s:.0f}s?"
+            f"{self.cfg.duration_loose_s:.0f}s?",
+            safety_critical=True,
         )
         info(
             f"STEP 4: execute @ {self.cfg.clamp_loose_deg}° clamp, "
@@ -256,8 +356,9 @@ class DeploySession:
         ok("loose execute complete")
 
     def step_closed_loop(self) -> Path:
-        confirm(
-            f"Proceed to {self.cfg.n_eval_episodes}-episode closed-loop eval?"
+        self._confirm(
+            f"Proceed to {self.cfg.n_eval_episodes}-episode closed-loop eval?",
+            safety_critical=True,
         )
         info("STEP 5: closed-loop eval (prompt_user_observer scoring)")
         self.cfg.eval_output_dir.mkdir(parents=True, exist_ok=True)
@@ -341,6 +442,8 @@ class DeploySession:
             "  closed-loop : "
             + ("skip" if self.cfg.skip_closed_loop else f"{self.cfg.n_eval_episodes} eps")
         )
+        info(f"  assume-yes  : {self.cfg.assume_yes}")
+        info(f"  mock-hw     : {self.cfg.mock_hardware}")
 
         try:
             self.step_preflight()
@@ -416,6 +519,9 @@ def build_session_parser() -> argparse.ArgumentParser:
     p.add_argument("--camera", default="d435_rgb=/dev/video0,640,480")
     p.add_argument("--task", default="pick and place cube")
     p.add_argument("--rate-hz", type=float, default=30.0)
+    p.add_argument("--duration-s", dest="duration_dry_s", type=float,
+                   default=30.0,
+                   help="duration of the dry / mock loop in seconds")
     p.add_argument("--clamp-tight", type=float, default=1.0)
     p.add_argument("--clamp-loose", type=float, default=3.0)
     p.add_argument("--dry-run-loop", action="store_true")
@@ -426,6 +532,20 @@ def build_session_parser() -> argparse.ArgumentParser:
                    action="store_false", default=True)
     p.add_argument("--safety-ack-only", action="store_true",
                    help="write the safety-ack file and exit")
+    p.add_argument("--yes", "--assume-yes", dest="assume_yes",
+                   action="store_true", default=False,
+                   help=("auto-answer 'yes' on confirm prompts (env: "
+                         "LEROBOT_ISAAC_DEPLOY_ASSUME_YES=1). NEVER "
+                         "auto-yes the --execute / closed-loop gates — "
+                         "the operator must still pass --execute "
+                         "explicitly for motor writes."))
+    p.add_argument("--mock-hardware", dest="mock_hardware",
+                   action="store_true", default=False,
+                   help=("skip the robot-data-run subprocess in the "
+                         "dry-loop step and run an in-process synthetic-"
+                         "obs inference loop. Incompatible with "
+                         "--execute. Use for smoke tests without "
+                         "serial port / camera."))
     return p
 
 
@@ -437,6 +557,8 @@ def cfg_from_namespace(ns: argparse.Namespace) -> SessionConfig:
     else:
         raise SystemExit("--policy-path or --winner required")
 
+    assume_yes = bool(ns.assume_yes) or _env_assume_yes()
+
     return SessionConfig(
         policy_path=policy_path,
         dataset_root=Path(ns.dataset_root),
@@ -444,6 +566,7 @@ def cfg_from_namespace(ns: argparse.Namespace) -> SessionConfig:
         camera=ns.camera,
         task=ns.task,
         rate_hz=ns.rate_hz,
+        duration_dry_s=ns.duration_dry_s,
         clamp_tight_deg=ns.clamp_tight,
         clamp_loose_deg=ns.clamp_loose,
         do_dry_loop=bool(ns.dry_run_loop),
@@ -451,4 +574,6 @@ def cfg_from_namespace(ns: argparse.Namespace) -> SessionConfig:
         skip_closed_loop=bool(ns.skip_closed_loop),
         n_eval_episodes=ns.n_eval_episodes,
         home_on_exit=bool(ns.home_on_exit),
+        assume_yes=assume_yes,
+        mock_hardware=bool(ns.mock_hardware),
     )
