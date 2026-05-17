@@ -52,6 +52,41 @@ pixi run sync-eval
 pixi run test
 ```
 
+## Smoke test without hardware
+
+Verify the checkpoint actually loads and emits actions on this machine
+*before* you plug the SO-101 in. Combines two flags:
+
+* `--yes` (or `--assume-yes`, or env `LEROBOT_ISAAC_DEPLOY_ASSUME_YES=1`)
+  — auto-answers the confirm prompts so the run is non-interactive.
+* `--mock-hardware` — skips the `robot-data-run` subprocess in the
+  dry-loop step and instead runs an in-process inference loop with
+  synthetic (zero-filled) observations sized to the policy's declared
+  `input_features`. No `/dev/ttyACM0`, no `/dev/video0`, no motor writes.
+
+```bash
+pixi run session -- \
+    --winner ~/path/to/winner.json \
+    --dataset-root ~/path/to/datasets/<user>/<dataset> \
+    --dry-run-loop --mock-hardware --yes \
+    --duration-s 5 --rate-hz 5     # short for smoke
+```
+
+Expected: preflight loads the policy, the mock loop prints
+`mock step N action={...}` for `duration_s × rate_hz` steps, then exits 0.
+
+### Safety: `--yes` does NOT auto-confirm motor writes
+
+The two `--execute` gates (1° and 3° clamps) and the closed-loop eval
+prompt are flagged `safety_critical` internally. `--yes` is **ignored**
+for those — the operator must still type `yes` on stdin, AND the
+`--execute` flag itself must be passed explicitly. This is intentional
+defense-in-depth: a CI run or a stuck shell pipe cannot accidentally
+drive the robot.
+
+`--mock-hardware` is incompatible with `--execute`. The session refuses
+the combination early (exit 1).
+
 ## Subcommands
 
 | Command             | Runs on   | What it does |
@@ -81,6 +116,7 @@ li-deploy-sync-eval
 
 * `--execute` is required to send motor commands. Default = dry-run.
 * Each motor-write step prompts `yes` on stdin first.
+* `--yes` / `--assume-yes` never auto-confirms a motor-write step.
 * `robot-data-runner` enforces server-side `--max-relative-target` clamp.
 * A physical e-stop is mandatory hardware; this script cannot replace it.
 
