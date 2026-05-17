@@ -62,17 +62,24 @@ def sync_ckpt_to_laptop(
         raise FileNotFoundError(f"run_dir not found: {run_dir}")
     run_name = run_dir.name
 
-    # Find the policy dir (policy-smolvla, policy-diffusion, etc.)
+    # Two supported layouts:
+    #   1. nightly tonight-script runs   → <run-dir>/policy-<arch>/checkpoints/
+    #   2. autoresearch trial dirs       → <run-dir>/checkpoints/
     policy_dirs = sorted(p for p in run_dir.glob("policy-*") if p.is_dir())
-    if not policy_dirs:
+    if policy_dirs:
+        ckpts_dir = policy_dirs[-1] / "checkpoints"
+        layout_hint = f"under {policy_dirs[-1]}"
+    elif (run_dir / "checkpoints").is_dir():
+        ckpts_dir = run_dir / "checkpoints"
+        layout_hint = f"under {run_dir}"
+    else:
         raise FileNotFoundError(
-            f"no policy-* directory under {run_dir} (expected policy-smolvla/, "
-            f"policy-diffusion/, …)"
+            f"no checkpoints found under {run_dir}: expected either "
+            f"policy-*/checkpoints/ (nightly layout) or checkpoints/ "
+            f"(autoresearch trial layout)"
         )
-    policy_dir = policy_dirs[-1]
-    ckpts_dir = policy_dir / "checkpoints"
     if not ckpts_dir.is_dir():
-        raise FileNotFoundError(f"no checkpoints/ under {policy_dir}")
+        raise FileNotFoundError(f"no checkpoints/ {layout_hint}")
 
     last = ckpts_dir / "last"
     if not (last / "pretrained_model").is_dir():
