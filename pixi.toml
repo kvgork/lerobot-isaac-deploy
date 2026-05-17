@@ -55,5 +55,19 @@ session    = "li-deploy-session"
 sync-ckpt  = "li-deploy-sync-ckpt"
 sync-eval  = "li-deploy-sync-eval"
 
+# sync the LAST checkpoint of the most recent autoresearch winner.
+# Reads outputs/eval/<latest-rerank>/winner.json from the training
+# workspace, resolves the trial run-dir, rsyncs the latest ckpt.
+#   pixi run sync-winner
+#   pixi run sync-winner -- --dry-run
+sync-winner = """bash -c '
+set -e
+TRAIN_WS="${LEROBOT_ISAAC_TRAIN_WS:-$HOME/workspaces/lerobot-isaac-training}"
+WINNER=$(ls -t "$TRAIN_WS"/outputs/eval/*-rerank/winner.json 2>/dev/null | head -1)
+[ -n "$WINNER" ] || { echo "no winner.json under $TRAIN_WS/outputs/eval/*-rerank/" >&2; exit 2; }
+echo "[sync-winner] $WINNER"
+li-deploy-sync-ckpt --winner "$WINNER" "$@"
+' --"""
+
 [environments]
 default = { features = ["test"], solve-group = "default" }

@@ -14,6 +14,7 @@ are importable so the CLI can also re-use them programmatically.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,28 @@ def _run_rsync(src: str, dst: str, *, dry_run: bool = False) -> int:
     args += [src, dst]
     print(f"[sync] $ {' '.join(args)}", flush=True)
     return subprocess.run(args, check=False).returncode
+
+
+def _resolve_run_dir_from_winner(winner_json: Path) -> Path:
+    """Read winner.json, return the training-run dir hosting the winner ckpt.
+
+    Walks the ``winner_policy_path`` up until it leaves the
+    ``pretrained_model/<ckpt-id>/checkpoints[/policy-<arch>]`` suffix.
+    Supports both layouts handled by ``sync_ckpt_to_laptop``.
+    """
+    data = json.loads(Path(winner_json).read_text())
+    ckpt = Path(data["winner_policy_path"]).resolve()
+    if ckpt.name == "pretrained_model":
+        ckpt = ckpt.parent                              # → <ckpt-id>/
+    if ckpt.parent.name == "checkpoints":
+        run_dir = ckpt.parent.parent                    # → <run> OR policy-<arch>/
+        if run_dir.name.startswith("policy-"):
+            run_dir = run_dir.parent                    # nightly layout: → <run>/
+        return run_dir
+    raise ValueError(
+        f"unrecognized winner_policy_path layout: {data['winner_policy_path']!r}. "
+        f"Expected …/checkpoints/<ckpt-id>/pretrained_model/."
+    )
 
 
 def _ensure_remote_dir(host: str, remote_path: str, *, dry_run: bool = False) -> int:
@@ -175,7 +198,12 @@ def sync_eval_from_laptop(
 def build_sync_ckpt_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="li-deploy-sync-ckpt",
                                 description="desktop → laptop ckpt sync")
-    p.add_argument("--run-dir", required=True)
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--run-dir",
+                    help="training run dir (auto-discovers latest ckpt inside)")
+    src.add_argument("--winner",
+                    help="winner.json from an autoresearch sweep "
+                         "(auto-resolves --run-dir from winner_policy_path)")
     p.add_argument("--host", default=DEFAULT_LAPTOP_HOST)
     p.add_argument("--laptop-base", default=DEFAULT_LAPTOP_BASE,
                    help="base path on the remote; ckpts land in "

@@ -35,12 +35,21 @@ def session_main(argv: list[str] | None = None) -> int:
 
 
 def sync_ckpt_main(argv: list[str] | None = None) -> int:
-    from lerobot_isaac_deploy.sync import build_sync_ckpt_parser, sync_ckpt_to_laptop
+    from lerobot_isaac_deploy.sync import (
+        _resolve_run_dir_from_winner,
+        build_sync_ckpt_parser,
+        sync_ckpt_to_laptop,
+    )
     from pathlib import Path
 
     ns = build_sync_ckpt_parser().parse_args(argv)
+    if ns.winner:
+        run_dir = _resolve_run_dir_from_winner(Path(ns.winner))
+        print(f"[sync] winner.json → run_dir: {run_dir}", flush=True)
+    else:
+        run_dir = Path(ns.run_dir)
     return sync_ckpt_to_laptop(
-        Path(ns.run_dir),
+        run_dir,
         host=ns.host,
         laptop_base=ns.laptop_base,
         remote_dir=ns.remote_dir,
