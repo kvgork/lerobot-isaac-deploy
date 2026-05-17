@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_LAPTOP_HOST = "laptop"
@@ -83,6 +85,7 @@ def sync_ckpt_to_laptop(
     host: str = DEFAULT_LAPTOP_HOST,
     laptop_base: str = DEFAULT_LAPTOP_BASE,
     remote_dir: str | None = None,
+    winner_json: Path | None = None,
     dry_run: bool = False,
 ) -> int:
     """Copy the latest pretrained_model + dashboard manifest to the laptop.
@@ -165,6 +168,36 @@ def sync_ckpt_to_laptop(
     if manifest.exists():
         _run_rsync(str(manifest), f"{dst_base}/manifest.json", dry_run=dry_run)
 
+    # If a winner.json was provided, write a laptop-local copy with the
+    # `winner_policy_path` rewritten to the destination layout. The
+    # source winner.json has desktop-absolute paths under
+    # `outputs/autoresearch-*/trial_N/checkpoints/<ckpt>/pretrained_model`
+    # which do NOT exist on the laptop. The rewritten copy lets the
+    # laptop run `pixi run session --winner models/<run>/winner.json`
+    # directly without manual path edits.
+    if winner_json is not None:
+        wj_path = Path(winner_json).resolve()
+        if not wj_path.is_file():
+            print(f"[sync] WARN: --winner-json not found: {wj_path}", flush=True)
+        else:
+            laptop_ckpt = f"{remote_base_path}/{last.name}/pretrained_model"
+            data = json.loads(wj_path.read_text())
+            data["winner_policy_path"] = laptop_ckpt
+            data["_source_winner_json"] = str(wj_path)
+            data["_synced_at"] = datetime.utcnow().isoformat() + "Z"
+            tmp = Path("/tmp") / f"winner-{run_name}-{os.getpid()}.json"
+            tmp.write_text(json.dumps(data, indent=2))
+            rc = _run_rsync(str(tmp), f"{dst_base}/winner.json", dry_run=dry_run)
+            if not dry_run:
+                tmp.unlink(missing_ok=True)
+            if rc != 0:
+                return rc
+            print(
+                f"[sync] wrote laptop winner.json → {dst_base}/winner.json "
+                f"(policy_path rewritten to {laptop_ckpt})",
+                flush=True,
+            )
+
     return rc
 
 
@@ -213,6 +246,11 @@ def build_sync_ckpt_parser() -> argparse.ArgumentParser:
                    help="EXACT remote destination dir (overrides --laptop-base "
                         "+ the auto-generated 'models/<run_name>' suffix). Use "
                         "to send to an external drive, e.g. /mnt/nvme/models/foo")
+    p.add_argument("--winner-json",
+                   help="path to the desktop winner.json to also ship alongside "
+                        "the ckpt with `winner_policy_path` rewritten for the "
+                        "laptop layout. When --winner is the source flag, this "
+                        "is set automatically by the CLI.")
     p.add_argument("--dry-run", action="store_true")
     return p
 

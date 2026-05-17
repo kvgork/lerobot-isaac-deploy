@@ -112,6 +112,57 @@ li-deploy-session --winner $HOME/workspaces/lerobot-isaac-deploy/checkpoints/...
 li-deploy-sync-eval
 ```
 
+## A → Z: AR agent winner on real SO-101 (3 commands)
+
+The fast path from "autoresearch sweep finished on desktop" to
+"motors moving on the laptop's SO-101":
+
+```bash
+# === DESKTOP (one command) ===
+cd ~/workspaces/lerobot-isaac-deploy
+pixi run sync-winner            # find newest winner.json, rsync ckpt + rewritten JSON
+# logs:
+#   [sync-winner] /home/.../outputs/eval/<latest>-rerank/winner.json
+#   [sync] $ ssh laptop mkdir -p ~/workspaces/lerobot-isaac-deploy/models/<run>/<ckpt>/pretrained_model
+#   [sync] $ rsync … pretrained_model/ → laptop:…/models/<run>/<ckpt>/pretrained_model/
+#   [sync] wrote laptop winner.json → …/models/<run>/winner.json
+#          (policy_path rewritten to laptop-local path)
+
+# === LAPTOP — smoke test the loaded model first (no motors) ===
+cd ~/workspaces/lerobot-isaac-deploy
+pixi run deploy-winner -- --dry-run-loop --yes
+# Loads the synced ckpt, runs the inference loop, prints actions, NO motor writes.
+
+# === LAPTOP — drive the SO-101 ===
+pixi run deploy-winner -- --execute      # confirm-gated 1° → 3° → 10-ep eval
+```
+
+`sync-winner` ships both the model AND a rewritten `winner.json`
+sitting next to it. `deploy-winner` finds the newest such file under
+`models/*/winner.json` and hands it to the confirm-gated session ladder.
+
+The session reads `winner_policy_path` from the *rewritten* JSON, which
+now resolves correctly on the laptop. The original desktop winner.json
+is preserved at `_source_winner_json` for traceability.
+
+After motors have moved:
+
+```bash
+# DESKTOP: pull eval JSONs back so the dashboard picks them up
+cd ~/workspaces/lerobot-isaac-deploy
+pixi run sync-eval
+```
+
+### Required laptop one-time setup
+
+* `pixi install` in `~/workspaces/lerobot-isaac-deploy/` (pulls
+  lerobot==0.5.1, robot-data-runner from github, deploy package).
+* `pixi run bootstrap` to prefetch SmolVLM2 weights.
+* SSH alias `laptop` configured in the desktop's `~/.ssh/config`
+  (needed by `sync-winner`).
+* SO-101 plugged in at `/dev/ttyACM0`, camera at `/dev/video0`
+  (override via `--port` / `--camera`).
+
 ## Safety contract
 
 * `--execute` is required to send motor commands. Default = dry-run.

@@ -69,5 +69,21 @@ echo "[sync-winner] $WINNER"
 li-deploy-sync-ckpt --winner "$WINNER" "$@"
 ' --"""
 
+# Run the most recently-synced winner on the SO-101 (LAPTOP-side).
+# Finds the newest models/<run>/winner.json, hands it to li-deploy-session.
+# Add `-- --execute` to actually move motors. Default is the safer
+# preflight + dry-run-loop path.
+#   pixi run deploy-winner                          # preflight only
+#   pixi run deploy-winner -- --dry-run-loop --yes  # inference loop, no motors
+#   pixi run deploy-winner -- --execute             # motor writes (requires SO-101)
+deploy-winner = """bash -c '
+set -e
+DEPLOY_BASE="$(pwd)"
+WINNER=$(ls -t "$DEPLOY_BASE"/models/*/winner.json 2>/dev/null | head -1)
+[ -n "$WINNER" ] || { echo "no winner.json under $DEPLOY_BASE/models/*/. Run pixi run sync-winner from desktop first." >&2; exit 2; }
+echo "[deploy-winner] $WINNER"
+li-deploy-session --winner "$WINNER" "$@"
+' --"""
+
 [environments]
 default = { features = ["test"], solve-group = "default" }

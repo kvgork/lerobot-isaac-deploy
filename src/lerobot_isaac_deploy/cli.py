@@ -43,16 +43,22 @@ def sync_ckpt_main(argv: list[str] | None = None) -> int:
     from pathlib import Path
 
     ns = build_sync_ckpt_parser().parse_args(argv)
+    winner_json = None
     if ns.winner:
         run_dir = _resolve_run_dir_from_winner(Path(ns.winner))
+        winner_json = Path(ns.winner)
         print(f"[sync] winner.json → run_dir: {run_dir}", flush=True)
     else:
         run_dir = Path(ns.run_dir)
+    # Explicit --winner-json overrides the auto-derived one from --winner.
+    if getattr(ns, "winner_json", None):
+        winner_json = Path(ns.winner_json)
     return sync_ckpt_to_laptop(
         run_dir,
         host=ns.host,
         laptop_base=ns.laptop_base,
         remote_dir=ns.remote_dir,
+        winner_json=winner_json,
         dry_run=ns.dry_run,
     )
 
