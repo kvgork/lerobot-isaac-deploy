@@ -402,9 +402,16 @@ def build_session_parser() -> argparse.ArgumentParser:
                      help="pretrained_model/ directory")
     grp.add_argument("--winner", default=None,
                      help="winner.json from the desktop sweep (resolves --policy-path)")
-    p.add_argument("--dataset-root",
-                   default=str(Path.home() / "workspaces" / "lerobot-isaac-deploy"
-                               / "datasets" / "kvgork" / "so101-pickplace1"))
+    # Dataset path defaults — override via LEROBOT_ISAAC_DEPLOY_DATASET_ROOT
+    # env var (preferred for multi-user setups) or the --dataset-root flag.
+    # The historical fallback location is the deploy pkg's datasets/ tree.
+    import os as _os
+    _default_dataset = _os.environ.get(
+        "LEROBOT_ISAAC_DEPLOY_DATASET_ROOT",
+        str(Path.home() / "workspaces" / "lerobot-isaac-deploy"
+            / "datasets" / "so101-pickplace1"),
+    )
+    p.add_argument("--dataset-root", default=_default_dataset)
     p.add_argument("--port", default="/dev/ttyACM0")
     p.add_argument("--camera", default="d435_rgb=/dev/video0,640,480")
     p.add_argument("--task", default="pick and place cube")

@@ -2,7 +2,7 @@
 
 Laptop-side deploy session orchestrator for SO-101 trained policies.
 
-Pairs with [`robot-data-runner`](https://github.com/kvgork/robot-data-runner)
+Pairs with [`robot-data-runner`](https://github.com/kvgork/robot_data_runner)
 (the low-level deploy CLI) and the
 [`lerobot-isaac-training`](https://github.com/kvgork/lerobot-isaac-training)
 workspace (the desktop trainer).
