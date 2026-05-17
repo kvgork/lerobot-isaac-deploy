@@ -24,11 +24,11 @@ setuptools = ">=71,<81"
 [pypi-dependencies]
 # Editable install of THIS package so console scripts get registered.
 lerobot-isaac-deploy = { path = ".", editable = true }
-# Sibling runner CLIs we orchestrate via subprocess. Installed from the
-# local spinout on the desktop. On the laptop, point this at the
-# laptop's clone (rsync or git clone first), or swap for a github URL
-# once the package is published.
-robot-data-runner = { git = "file:///home/koen/workspaces/spinouts/robot_data_runner", branch = "main" }
+# Sibling runner CLIs we orchestrate via subprocess.
+# Source: https://github.com/kvgork/robot_data_runner
+# Portable across desktop + laptop. Swap to ssh://git@github.com/...
+# if the repo goes private.
+robot-data-runner = { git = "https://github.com/kvgork/robot_data_runner.git", branch = "main" }
 # Pinned to match the desktop training env (see CLAUDE.md of the training repo).
 lerobot = { version = "==0.5.1", extras = ["smolvla"] }
 
