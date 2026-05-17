@@ -487,6 +487,54 @@ def resolve_winner_policy(winner_json: Path) -> Path:
     return Path(p)
 
 
+def resolve_winner_dataset_root(winner_json: Path) -> Path | None:
+    """Read a (rewritten) winner.json, return ``dataset_root`` if present.
+
+    Returns ``None`` when the JSON lacks the field — caller should fall
+    back to the env var / hardcoded default.
+    """
+    data = json.loads(Path(winner_json).read_text(encoding="utf-8"))
+    p = data.get("dataset_root")
+    if not p:
+        return None
+    return Path(p)
+
+
+def _hardcoded_dataset_fallback() -> Path:
+    """The deploy-pkg-local default for ``dataset_root``."""
+    return (
+        Path.home() / "workspaces" / "lerobot-isaac-deploy"
+        / "datasets" / "so101-pickplace1"
+    )
+
+
+def _resolve_dataset_root(
+    cli_value: str | None,
+    winner_json: Path | None,
+) -> Path:
+    """Apply the dataset-root precedence ladder.
+
+    Order:
+        1. Explicit ``--dataset-root`` (CLI flag).
+        2. ``dataset_root`` field from ``--winner`` JSON.
+        3. ``LEROBOT_ISAAC_DEPLOY_DATASET_ROOT`` env var.
+        4. Hardcoded fallback under the deploy pkg's ``datasets/``.
+    """
+    if cli_value:
+        return Path(cli_value)
+    if winner_json is not None:
+        try:
+            from_winner = resolve_winner_dataset_root(winner_json)
+        except (OSError, json.JSONDecodeError):
+            from_winner = None
+        if from_winner is not None:
+            return from_winner
+    env_val = os.environ.get("LEROBOT_ISAAC_DEPLOY_DATASET_ROOT", "").strip()
+    if env_val:
+        return Path(env_val)
+    return _hardcoded_dataset_fallback()
+
+
 # ---------------------------------------------------------------------------
 # argparse wiring (used by cli.py)
 # ---------------------------------------------------------------------------
@@ -505,16 +553,13 @@ def build_session_parser() -> argparse.ArgumentParser:
                      help="pretrained_model/ directory")
     grp.add_argument("--winner", default=None,
                      help="winner.json from the desktop sweep (resolves --policy-path)")
-    # Dataset path defaults — override via LEROBOT_ISAAC_DEPLOY_DATASET_ROOT
-    # env var (preferred for multi-user setups) or the --dataset-root flag.
-    # The historical fallback location is the deploy pkg's datasets/ tree.
-    import os as _os
-    _default_dataset = _os.environ.get(
-        "LEROBOT_ISAAC_DEPLOY_DATASET_ROOT",
-        str(Path.home() / "workspaces" / "lerobot-isaac-deploy"
-            / "datasets" / "so101-pickplace1"),
-    )
-    p.add_argument("--dataset-root", default=_default_dataset)
+    # Default is None so cfg_from_namespace() can detect explicit-vs-default
+    # and apply the precedence ladder (winner.json → env → hardcoded).
+    p.add_argument("--dataset-root", default=None,
+                   help=("LeRobotDataset root used to recover preprocessor stats. "
+                         "Precedence: explicit flag > winner.json[dataset_root] > "
+                         "LEROBOT_ISAAC_DEPLOY_DATASET_ROOT env > "
+                         "<deploy>/datasets/so101-pickplace1."))
     p.add_argument("--port", default="/dev/ttyACM0")
     p.add_argument("--camera", default="d435_rgb=/dev/video0,640,480")
     p.add_argument("--task", default="pick and place cube")
@@ -558,10 +603,12 @@ def cfg_from_namespace(ns: argparse.Namespace) -> SessionConfig:
         raise SystemExit("--policy-path or --winner required")
 
     assume_yes = bool(ns.assume_yes) or _env_assume_yes()
+    winner_path = Path(ns.winner) if ns.winner else None
+    dataset_root = _resolve_dataset_root(ns.dataset_root, winner_path)
 
     return SessionConfig(
         policy_path=policy_path,
-        dataset_root=Path(ns.dataset_root),
+        dataset_root=dataset_root,
         port=ns.port,
         camera=ns.camera,
         task=ns.task,

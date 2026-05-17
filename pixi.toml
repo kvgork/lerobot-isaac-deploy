@@ -57,7 +57,10 @@ sync-eval  = "li-deploy-sync-eval"
 
 # sync the LAST checkpoint of the most recent autoresearch winner.
 # Reads outputs/eval/<latest-rerank>/winner.json from the training
-# workspace, resolves the trial run-dir, rsyncs the latest ckpt.
+# workspace, resolves the trial run-dir, rsyncs the latest ckpt AND
+# the LeRobotDataset it was trained against. The dataset path is
+# read from the matching .agent-state/<session-id>-ar/autoresearch/
+# <slug>/program.json (sibling to the rerank dir on the desktop).
 #   pixi run sync-winner
 #   pixi run sync-winner -- --dry-run
 sync-winner = """bash -c '
@@ -66,13 +69,40 @@ TRAIN_WS="${LEROBOT_ISAAC_TRAIN_WS:-$HOME/workspaces/lerobot-isaac-training}"
 WINNER=$(ls -t "$TRAIN_WS"/outputs/eval/*-rerank/winner.json 2>/dev/null | head -1)
 [ -n "$WINNER" ] || { echo "no winner.json under $TRAIN_WS/outputs/eval/*-rerank/" >&2; exit 2; }
 echo "[sync-winner] $WINNER"
-li-deploy-sync-ckpt --winner "$WINNER" "$@"
+
+# Map: outputs/eval/<base>-rerank/winner.json
+#   ↔ .agent-state/<base>-ar/autoresearch/<slug>/program.json
+RERANK_DIR=$(dirname "$WINNER")
+RERANK_NAME=$(basename "$RERANK_DIR")
+BASE_NAME="${RERANK_NAME%-rerank}"
+AR_GLOB="$TRAIN_WS/.agent-state/${BASE_NAME}-ar/autoresearch/*/program.json"
+PROGRAM=$(ls -t $AR_GLOB 2>/dev/null | head -1)
+DATASET_ARG=""
+if [ -n "$PROGRAM" ]; then
+    REL_DATASET=$(python3 -c "import json,sys;d=json.load(open(\\"$PROGRAM\\"));print(d.get(\\"dataset\\",\\"\\"))" 2>/dev/null || true)
+    if [ -n "$REL_DATASET" ]; then
+        DATASET_ABS="$TRAIN_WS/$REL_DATASET"
+        if [ -d "$DATASET_ABS" ]; then
+            echo "[sync-winner] dataset → $DATASET_ABS"
+            DATASET_ARG="--dataset-root $DATASET_ABS"
+        else
+            echo "[sync-winner] WARN: dataset path from program.json does not exist on disk: $DATASET_ABS" >&2
+        fi
+    else
+        echo "[sync-winner] WARN: program.json had no dataset field: $PROGRAM" >&2
+    fi
+else
+    echo "[sync-winner] WARN: no program.json under $AR_GLOB — skipping dataset rsync" >&2
+fi
+
+li-deploy-sync-ckpt --winner "$WINNER" $DATASET_ARG "$@"
 ' --"""
 
 # Run the most recently-synced winner on the SO-101 (LAPTOP-side).
 # Finds the newest models/<run>/winner.json, hands it to li-deploy-session.
 # Add `-- --execute` to actually move motors. Default is the safer
-# preflight + dry-run-loop path.
+# preflight + dry-run-loop path. The rewritten winner.json carries
+# `dataset_root` so no --dataset-root flag is needed.
 #   pixi run deploy-winner                          # preflight only
 #   pixi run deploy-winner -- --dry-run-loop --yes  # inference loop, no motors
 #   pixi run deploy-winner -- --execute             # motor writes (requires SO-101)

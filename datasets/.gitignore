@@ -1,0 +1,4 @@
+# Ignore every dataset dropped here — but keep the folder itself tracked.
+*
+!README.md
+!.gitignore

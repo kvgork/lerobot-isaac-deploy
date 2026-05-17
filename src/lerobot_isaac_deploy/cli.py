@@ -53,12 +53,14 @@ def sync_ckpt_main(argv: list[str] | None = None) -> int:
     # Explicit --winner-json overrides the auto-derived one from --winner.
     if getattr(ns, "winner_json", None):
         winner_json = Path(ns.winner_json)
+    dataset_root = Path(ns.dataset_root) if getattr(ns, "dataset_root", None) else None
     return sync_ckpt_to_laptop(
         run_dir,
         host=ns.host,
         laptop_base=ns.laptop_base,
         remote_dir=ns.remote_dir,
         winner_json=winner_json,
+        dataset_root=dataset_root,
         dry_run=ns.dry_run,
     )
 

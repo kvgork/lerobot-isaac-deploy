@@ -3,7 +3,8 @@
 Two directions:
 
 * ``sync_ckpt_to_laptop`` — runs on DESKTOP, copies a checkpoint dir
-  (and optional dashboard manifest) to the laptop's deploy workspace.
+  (and optional dashboard manifest + LeRobotDataset) to the laptop's
+  deploy workspace.
 * ``sync_eval_from_laptop`` — runs on DESKTOP, pulls closed-loop eval
   JSONs back so the dashboard's Evaluation tab picks them up.
 
@@ -86,6 +87,7 @@ def sync_ckpt_to_laptop(
     laptop_base: str = DEFAULT_LAPTOP_BASE,
     remote_dir: str | None = None,
     winner_json: Path | None = None,
+    dataset_root: Path | None = None,
     dry_run: bool = False,
 ) -> int:
     """Copy the latest pretrained_model + dashboard manifest to the laptop.
@@ -106,6 +108,19 @@ def sync_ckpt_to_laptop(
         If set, becomes the EXACT destination directory on the remote
         host (overrides the computed ``<laptop_base>/checkpoints/<run_name>``
         path). Use this to send to an external drive or a custom layout.
+        Dataset destination is independent of ``remote_dir`` — datasets
+        always land under ``<laptop_base>/datasets/<basename>/`` since
+        multiple ckpts often share a dataset.
+    winner_json:
+        Optional path to the desktop winner.json. When set, a rewritten
+        copy is shipped alongside the ckpt with ``winner_policy_path``
+        pointing at the laptop-local layout. When ``dataset_root`` is
+        also set, the rewritten JSON gains a ``dataset_root`` field
+        pointing at the laptop-local dataset path.
+    dataset_root:
+        Optional path to the LeRobotDataset tree the ckpt was trained
+        on. When set, rsync the tree to
+        ``<laptop_base>/datasets/<basename>/`` after the ckpt rsync.
     """
     run_dir = Path(run_dir).resolve()
     if not run_dir.is_dir():
@@ -168,6 +183,37 @@ def sync_ckpt_to_laptop(
     if manifest.exists():
         _run_rsync(str(manifest), f"{dst_base}/manifest.json", dry_run=dry_run)
 
+    # Dataset rsync — independent of remote_dir, lands at
+    # <laptop_base>/datasets/<basename>/. Performed BEFORE the winner.json
+    # rewrite so the rewritten JSON can record the laptop-local path.
+    laptop_dataset_path: str | None = None
+    if dataset_root is not None:
+        ds_path = Path(dataset_root).resolve()
+        if not ds_path.is_dir():
+            print(
+                f"[sync] WARN: --dataset-root not a directory, skipping: {ds_path}",
+                flush=True,
+            )
+        else:
+            ds_basename = ds_path.name
+            laptop_dataset_path = (
+                f"{laptop_base.rstrip('/')}/datasets/{ds_basename}"
+            )
+            rc = _ensure_remote_dir(host, laptop_dataset_path, dry_run=dry_run)
+            if rc != 0:
+                return rc
+            rc = _run_rsync(
+                f"{ds_path}/",
+                f"{host}:{laptop_dataset_path}/",
+                dry_run=dry_run,
+            )
+            if rc != 0:
+                return rc
+            print(
+                f"[sync] dataset → {host}:{laptop_dataset_path}/",
+                flush=True,
+            )
+
     # If a winner.json was provided, write a laptop-local copy with the
     # `winner_policy_path` rewritten to the destination layout. The
     # source winner.json has desktop-absolute paths under
@@ -183,6 +229,8 @@ def sync_ckpt_to_laptop(
             laptop_ckpt = f"{remote_base_path}/{last.name}/pretrained_model"
             data = json.loads(wj_path.read_text())
             data["winner_policy_path"] = laptop_ckpt
+            if laptop_dataset_path is not None:
+                data["dataset_root"] = laptop_dataset_path
             data["_source_winner_json"] = str(wj_path)
             data["_synced_at"] = datetime.utcnow().isoformat() + "Z"
             tmp = Path("/tmp") / f"winner-{run_name}-{os.getpid()}.json"
@@ -192,9 +240,14 @@ def sync_ckpt_to_laptop(
                 tmp.unlink(missing_ok=True)
             if rc != 0:
                 return rc
+            extras = (
+                f" + dataset_root={laptop_dataset_path}"
+                if laptop_dataset_path is not None
+                else ""
+            )
             print(
                 f"[sync] wrote laptop winner.json → {dst_base}/winner.json "
-                f"(policy_path rewritten to {laptop_ckpt})",
+                f"(policy_path rewritten to {laptop_ckpt}{extras})",
                 flush=True,
             )
 
@@ -251,6 +304,13 @@ def build_sync_ckpt_parser() -> argparse.ArgumentParser:
                         "the ckpt with `winner_policy_path` rewritten for the "
                         "laptop layout. When --winner is the source flag, this "
                         "is set automatically by the CLI.")
+    p.add_argument("--dataset-root",
+                   help="path to the LeRobotDataset tree the ckpt was trained "
+                        "on. When set, rsync it to "
+                        "<laptop-base>/datasets/<basename>/ alongside the ckpt. "
+                        "The rewritten winner.json (if --winner / --winner-json "
+                        "is also set) gains a `dataset_root` field that "
+                        "session.py picks up automatically.")
     p.add_argument("--dry-run", action="store_true")
     return p
 
