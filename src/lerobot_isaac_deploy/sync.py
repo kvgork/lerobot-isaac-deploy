@@ -23,12 +23,30 @@ DEFAULT_LAPTOP_BASE = "~/workspaces/lerobot-isaac-deploy"
 
 
 def _run_rsync(src: str, dst: str, *, dry_run: bool = False) -> int:
-    args = ["rsync", "-avhP"]
+    # --mkpath (rsync ≥ 3.2.3) creates missing destination directories. The
+    # explicit SSH mkdir below is the belt-and-suspenders fallback for older
+    # rsync versions on the receiver.
+    args = ["rsync", "-avhP", "--mkpath"]
     if dry_run:
         args.append("--dry-run")
     args += [src, dst]
     print(f"[sync] $ {' '.join(args)}", flush=True)
     return subprocess.run(args, check=False).returncode
+
+
+def _ensure_remote_dir(host: str, remote_path: str, *, dry_run: bool = False) -> int:
+    """SSH-mkdir -p the remote directory before rsync. Idempotent.
+
+    rsync's default behavior only creates ONE level of missing parent dirs.
+    Multi-level destinations (e.g. `<base>/checkpoints/<run>/<ckpt>/`) fail
+    with `mkdir … No such file or directory (2)` on first sync. This
+    pre-flight closes that gap.
+    """
+    cmd = ["ssh", host, "mkdir", "-p", remote_path]
+    print(f"[sync] $ {' '.join(cmd)}", flush=True)
+    if dry_run:
+        return 0
+    return subprocess.run(cmd, check=False).returncode
 
 
 # --------------------------------------------------------------------------- #
@@ -41,6 +59,7 @@ def sync_ckpt_to_laptop(
     *,
     host: str = DEFAULT_LAPTOP_HOST,
     laptop_base: str = DEFAULT_LAPTOP_BASE,
+    remote_dir: str | None = None,
     dry_run: bool = False,
 ) -> int:
     """Copy the latest pretrained_model + dashboard manifest to the laptop.
@@ -54,8 +73,13 @@ def sync_ckpt_to_laptop(
     host:
         SSH alias for the laptop.
     laptop_base:
-        Base path on the laptop where ckpts land. Will create
-        ``<base>/checkpoints/<run_name>/`` on first sync.
+        Base path on the laptop. The default destination is
+        ``<laptop_base>/checkpoints/<run_name>/``. Ignored if
+        ``remote_dir`` is set.
+    remote_dir:
+        If set, becomes the EXACT destination directory on the remote
+        host (overrides the computed ``<laptop_base>/checkpoints/<run_name>``
+        path). Use this to send to an external drive or a custom layout.
     """
     run_dir = Path(run_dir).resolve()
     if not run_dir.is_dir():
@@ -90,7 +114,22 @@ def sync_ckpt_to_laptop(
             raise FileNotFoundError(f"no pretrained_model dirs under {ckpts_dir}")
         last = numbered[-1]
 
-    dst_base = f"{host}:{laptop_base}/checkpoints/{run_name}"
+    if remote_dir is not None:
+        remote_base_path = remote_dir.rstrip("/")
+    else:
+        remote_base_path = f"{laptop_base.rstrip('/')}/models/{run_name}"
+    dst_base = f"{host}:{remote_base_path}"
+
+    # Pre-flight: ensure the destination dir exists on the remote. Closes
+    # the gap left by rsync only auto-creating ONE level of parents.
+    rc = _ensure_remote_dir(
+        host,
+        f"{remote_base_path}/{last.name}/pretrained_model",
+        dry_run=dry_run,
+    )
+    if rc != 0:
+        return rc
+
     rc = _run_rsync(
         f"{last}/pretrained_model/",
         f"{dst_base}/{last.name}/pretrained_model/",
@@ -138,7 +177,14 @@ def build_sync_ckpt_parser() -> argparse.ArgumentParser:
                                 description="desktop → laptop ckpt sync")
     p.add_argument("--run-dir", required=True)
     p.add_argument("--host", default=DEFAULT_LAPTOP_HOST)
-    p.add_argument("--laptop-base", default=DEFAULT_LAPTOP_BASE)
+    p.add_argument("--laptop-base", default=DEFAULT_LAPTOP_BASE,
+                   help="base path on the remote; ckpts land in "
+                        "<laptop-base>/models/<run_name>/ (default: "
+                        f"{DEFAULT_LAPTOP_BASE})")
+    p.add_argument("--remote-dir",
+                   help="EXACT remote destination dir (overrides --laptop-base "
+                        "+ the auto-generated 'models/<run_name>' suffix). Use "
+                        "to send to an external drive, e.g. /mnt/nvme/models/foo")
     p.add_argument("--dry-run", action="store_true")
     return p
 

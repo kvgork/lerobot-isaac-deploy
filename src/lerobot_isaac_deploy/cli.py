@@ -43,6 +43,7 @@ def sync_ckpt_main(argv: list[str] | None = None) -> int:
         Path(ns.run_dir),
         host=ns.host,
         laptop_base=ns.laptop_base,
+        remote_dir=ns.remote_dir,
         dry_run=ns.dry_run,
     )
 
