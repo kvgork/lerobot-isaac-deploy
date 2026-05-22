@@ -10,6 +10,12 @@ Returns one of:
 * ``lewm``       HF LeWorldModel checkpoint.  Identified by a top-level
                  ``leworldmodel_config.json`` or a ``policy.json`` whose
                  ``type`` is ``le_world_model``.
+* ``vjepa``      V-JEPA video world model — encoder-only, no actor head.
+                 Identified by ``vjepa_config.json``.
+* ``cosmos``     NVIDIA Cosmos video WM — data engine, no actor head.
+                 Identified by ``cosmos_config.json``.
+* ``gaia``       GAIA-style generative video WM — no actor head.
+                 Identified by ``gaia_config.json``.
 * ``unknown``    Nothing matched; the caller should refuse to load.
 
 Pure detection — does not import lerobot / sheeprl / torch. Safe to call
@@ -22,7 +28,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
-PolicyKind = Literal["lerobot", "dreamerv3", "lewm", "unknown"]
+PolicyKind = Literal["lerobot", "dreamerv3", "lewm", "vjepa", "cosmos", "gaia", "unknown"]
 
 
 def detect_policy_kind(path: Path | str) -> PolicyKind:
@@ -40,6 +46,9 @@ def detect_policy_kind(path: Path | str) -> PolicyKind:
                      OR ``<path>/<run-name>/{.hydra/...,ckpt_*.ckpt}``
         * lewm:      ``<path>/leworldmodel_config.json`` OR
                      ``<path>/policy.json`` with type ``le_world_model``
+        * vjepa:     ``<path>/vjepa_config.json``
+        * cosmos:    ``<path>/cosmos_config.json``
+        * gaia:      ``<path>/gaia_config.json``
 
     Returns
     -------
@@ -88,6 +97,18 @@ def detect_policy_kind(path: Path | str) -> PolicyKind:
             except Exception:  # noqa: BLE001
                 pass
 
+        # V-JEPA video world model — encoder-only, no actor
+        if (c / "vjepa_config.json").is_file():
+            return "vjepa"
+
+        # NVIDIA Cosmos — generative data engine, no actor
+        if (c / "cosmos_config.json").is_file():
+            return "cosmos"
+
+        # GAIA-style generative video WM — no actor
+        if (c / "gaia_config.json").is_file():
+            return "gaia"
+
     return "unknown"
 
 
@@ -97,5 +118,26 @@ def explain(kind: PolicyKind) -> str:
         "lerobot":   "LeRobot policy (smolvla / act / diffusion) — direct deploy",
         "dreamerv3": "DreamerV3 (sheeprl) — actor head used for deploy",
         "lewm":      "HF LeWorldModel — no actor; use wm-rollout for offline sim",
+        "vjepa":     "V-JEPA video world model — no robot-control path (deferred research)",
+        "cosmos":    "NVIDIA Cosmos video WM — data engine, no actor (deferred research)",
+        "gaia":      "GAIA-style generative video WM — no actor (deferred research)",
         "unknown":   "unknown — cannot route to any loader",
     }[kind]
+
+
+def is_synthetic(path: Path | str) -> bool:
+    """True iff <path>/synthetic_marker.json exists.
+
+    Used by motor-write gates to refuse real-arm execution against
+    a fixture/test checkpoint. See plans/2026-05-22-wm-deploy-on-so101.md.
+    """
+    p = Path(path)
+    if not p.exists() or not p.is_dir():
+        return False
+    # Check the path itself and one level deep — same shape as detect_policy_kind.
+    if (p / "synthetic_marker.json").is_file():
+        return True
+    for sub in p.iterdir():
+        if sub.is_dir() and (sub / "synthetic_marker.json").is_file():
+            return True
+    return False
