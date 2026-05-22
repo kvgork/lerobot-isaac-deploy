@@ -7,9 +7,19 @@ Two paths:
   the same ``obs`` dict as a LeRobot policy and returns an action tensor.
   Stateful — maintains the recurrent hidden state across calls.
 
+  If the checkpoint directory contains a ``synthetic_marker.json`` file,
+  ``load_dreamerv3`` short-circuits immediately and returns a
+  :class:`_SyntheticActor` (no torch / sheeprl import required).  This
+  lets tests and mock-hardware smoke runs work in any environment.
+
 * :func:`load_lewm` — refuses with a clear message that LeWM has no
   actor and points at :mod:`lerobot_isaac_deploy.wm_rollout` for offline
   simulation.
+
+Callers should duck-type on ``.select_action(obs)`` + ``.reset()`` only.
+Both :class:`LoadedWMActor` and :class:`_SyntheticActor` expose that
+minimal interface; ``select_action`` always returns a ``numpy.ndarray``
+of shape ``(action_dim,)`` and dtype ``float32``.
 
 The dreamer loader is intentionally lazy about its imports — it can be
 called from any environment as long as ``torch`` + ``sheeprl`` are
@@ -29,6 +39,65 @@ class WMDeployNotSupported(RuntimeError):
     """Raised when a checkpoint kind cannot be deployed on hardware."""
 
 
+# ---------------------------------------------------------------------------
+# Synthetic-marker helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_synthetic_marker(cp: Path) -> tuple[bool, dict | None]:
+    """Return (True, marker_dict) if cp (or one level up) has synthetic_marker.json."""
+    import json
+
+    p = Path(cp)
+    candidates = [p if p.is_dir() else p.parent, p.parent if p.is_file() else None]
+    for c in candidates:
+        if c and c.is_dir():
+            m = c / "synthetic_marker.json"
+            if m.is_file():
+                try:
+                    return True, json.loads(m.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    return True, {}
+    return False, None
+
+
+class _SyntheticActor:
+    """No-op actor returned when a synthetic_marker.json is present.
+
+    Returns zero-valued actions of the declared ``action_dim``.
+    No torch / sheeprl dependency.
+    """
+
+    def __init__(self, action_dim: int) -> None:
+        self.action_dim = int(action_dim)
+
+    def select_action(self, obs: Any) -> Any:  # noqa: ARG002
+        import numpy as np
+
+        return np.zeros((self.action_dim,), dtype=np.float32)
+
+    def reset(self) -> None:
+        pass
+
+    @property
+    def kind(self) -> str:
+        return "dreamerv3"
+
+    @property
+    def device(self) -> str:
+        return "cpu"
+
+
+def _make_synthetic_actor(action_dim: int, kind: str) -> _SyntheticActor:  # noqa: ARG001
+    """Return a :class:`_SyntheticActor` for the given action dimensionality."""
+    return _SyntheticActor(action_dim=action_dim)
+
+
+# ---------------------------------------------------------------------------
+# LoadedWMActor — real sheeprl actor wrapper
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class LoadedWMActor:
     """DreamerV3 actor + recurrent-state container.
@@ -36,6 +105,10 @@ class LoadedWMActor:
     Mirrors :class:`robot_data_runner.policy_loader.LoadedPolicy` so the
     session can hold either type and call ``.select_action(obs_dict)``
     uniformly.
+
+    ``select_action`` always returns a ``numpy.ndarray`` of shape
+    ``(action_dim,)`` dtype ``float32`` — callers should not rely on a
+    torch tensor being returned.
     """
 
     actor: Any
@@ -49,7 +122,8 @@ class LoadedWMActor:
         self._state = None
 
     def select_action(self, obs: dict) -> Any:
-        """Run encoder → recurrent update → actor; return action tensor."""
+        """Run encoder → recurrent update → actor; return action as numpy array."""
+        import numpy as np
         import torch
 
         # Encode current observation
@@ -61,7 +135,16 @@ class LoadedWMActor:
                 self._state = self.actor.init_state(bs, device=self.device)
             # Update recurrent state + sample action.
             self._state, action = self.actor.step(z, self._state)
-        return action
+
+        # Normalise to ndarray so callers don't need to import torch.
+        if hasattr(action, "detach"):
+            return action.detach().cpu().numpy().reshape(-1).astype(np.float32)
+        return np.asarray(action, dtype=np.float32).reshape(-1)
+
+
+# ---------------------------------------------------------------------------
+# Public loaders
+# ---------------------------------------------------------------------------
 
 
 def load_dreamerv3(
@@ -69,7 +152,7 @@ def load_dreamerv3(
     *,
     config_yaml: Path | str | None = None,
     device: str | None = None,
-) -> LoadedWMActor:
+) -> LoadedWMActor | _SyntheticActor:
     """Load a sheeprl DreamerV3 checkpoint into an inference-ready actor.
 
     Parameters
@@ -88,7 +171,22 @@ def load_dreamerv3(
     ``world_model``, ``actor``, ``critic``, ``actor_target``, etc.
     We restore only ``world_model.encoder`` + ``actor`` since deploy
     doesn't need critic/replay buffer.
+
+    Synthetic-marker short-circuit
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    If ``checkpoint_path`` (or its parent directory) contains a
+    ``synthetic_marker.json`` file, this function returns a
+    :class:`_SyntheticActor` immediately — torch and sheeprl are never
+    imported. The marker JSON may include ``action_dim`` (default 6).
+    This allows tests and mock-hardware smoke runs in any environment.
     """
+    cp = Path(checkpoint_path)
+    synth, marker = _is_synthetic_marker(cp)
+    if synth:
+        action_dim = int((marker or {}).get("action_dim", 6))
+        return _make_synthetic_actor(action_dim=action_dim, kind="dreamerv3")
+
+    # --- real sheeprl path below ---
     try:
         import torch
     except ImportError as exc:
@@ -105,7 +203,6 @@ def load_dreamerv3(
             "pip install pyyaml"
         ) from exc
 
-    cp = Path(checkpoint_path)
     if cp.is_dir():
         candidates = sorted(cp.glob("**/ckpt_*.ckpt"))
         if not candidates:

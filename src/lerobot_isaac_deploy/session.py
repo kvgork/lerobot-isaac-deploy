@@ -33,6 +33,13 @@ image observations matching ``policy.config.input_features``. Useful
 for verifying end-to-end inference on a desktop with no SO-101 plugged
 in. Mock-hardware is incompatible with ``--execute`` and the
 closed-loop eval — those paths require real hardware.
+
+Real-ckpt gate
+--------------
+Pass ``--require-real-ckpt`` (or set
+``LI_DEPLOY_REQUIRE_REAL_CKPT=1``) to refuse motor-write steps when the
+checkpoint directory contains a ``synthetic_marker.json`` test fixture.
+This prevents accidental real-arm execution with a mock checkpoint.
 """
 
 from __future__ import annotations
@@ -74,6 +81,7 @@ class SessionConfig:
     skip_closed_loop: bool = False
     assume_yes: bool = False
     mock_hardware: bool = False
+    require_real_ckpt: bool = False
     eval_output_dir: Path = field(
         default_factory=lambda: Path.home() / "outputs" / "eval"
     )
@@ -100,6 +108,12 @@ _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 def _env_assume_yes() -> bool:
     """Honor ``LEROBOT_ISAAC_DEPLOY_ASSUME_YES`` (case-insensitive truthy)."""
     val = os.environ.get("LEROBOT_ISAAC_DEPLOY_ASSUME_YES", "").strip().lower()
+    return val in _TRUTHY
+
+
+def _env_require_real_ckpt() -> bool:
+    """Honor ``LI_DEPLOY_REQUIRE_REAL_CKPT`` (case-insensitive truthy)."""
+    val = os.environ.get("LI_DEPLOY_REQUIRE_REAL_CKPT", "").strip().lower()
     return val in _TRUTHY
 
 
@@ -175,6 +189,8 @@ class DeploySession:
         self.safety_ack = (
             Path.home() / ".config" / "robot-data-runner" / "safety_ack"
         )
+        # Set by _validate_inputs so downstream steps can dispatch on kind.
+        self._ckpt_kind: str = "unknown"
 
     # ----- discovery ---------------------------------------------------- #
 
@@ -216,22 +232,16 @@ class DeploySession:
         from lerobot_isaac_deploy.policy_kind import detect_policy_kind, explain
         kind = detect_policy_kind(self.cfg.policy_path)
         info(f"detected policy kind: {kind} — {explain(kind)}")
+
         if kind == "lerobot":
+            self._ckpt_kind = "lerobot"
             return
+
         if kind == "dreamerv3":
-            raise RuntimeError(
-                "DreamerV3 deploy via the LeRobot CLI ladder is not yet "
-                "wired. The actor is loadable via "
-                "lerobot_isaac_deploy.wm_loader.load_dreamerv3, but the "
-                "robot-data-runner subprocess assumes a LeRobot policy "
-                "factory checkpoint. Either:\n"
-                "  • train a LeRobot policy (smolvla/act/diffusion) on the "
-                "same task and deploy that, OR\n"
-                "  • use `lerobot-isaac-deploy wm-rollout` for offline "
-                "dream-rollout (no motors), OR\n"
-                "  • wait for the in-process dreamer-actor deploy path "
-                "(see plans/2026-05-16-dreamer-actor-deploy.md)."
-            )
+            # DreamerV3 is first-class: actor head used for closed-loop deploy.
+            self._ckpt_kind = "dreamerv3"
+            return
+
         if kind == "lewm":
             raise RuntimeError(
                 "LeWorldModel checkpoints have no actor head. Use "
@@ -239,10 +249,32 @@ class DeploySession:
                 "For real-robot control on this task, deploy a LeRobot "
                 "policy trained on the same dataset."
             )
+
+        if kind in ("vjepa", "cosmos", "gaia"):
+            raise RuntimeError(
+                f"{kind!r} is a video world model with no robot-control actor. "
+                f"See lerobot_isaac_deploy.wm_video.load_{kind} for the stub "
+                f"entry-point — these models are deferred research "
+                f"(plans/2026-05-22-wm-deploy-on-so101.md)."
+            )
+
         raise RuntimeError(
             f"could not detect checkpoint kind at {self.cfg.policy_path}; "
             f"expected lerobot / dreamerv3 / lewm shape"
         )
+
+    def _check_real_ckpt_gate(self) -> None:
+        """Raise if require_real_ckpt is set and the ckpt is synthetic."""
+        if self.cfg.require_real_ckpt:
+            from lerobot_isaac_deploy.policy_kind import is_synthetic
+
+            if is_synthetic(self.cfg.policy_path):
+                raise RuntimeError(
+                    f"--require-real-ckpt: refusing motor write — checkpoint "
+                    f"at {self.cfg.policy_path} is a synthetic test fixture "
+                    f"(has synthetic_marker.json). Provide a real ckpt or "
+                    f"drop --require-real-ckpt."
+                )
 
     def write_safety_ack(self) -> None:
         """Create the one-time safety-ack marker so the eval CLI doesn't block."""
@@ -285,10 +317,20 @@ class DeploySession:
                 f"STEP 2 (mock): in-process synthetic-obs inference "
                 f"({self.cfg.duration_dry_s:.0f}s @ {self.cfg.rate_hz:.0f} Hz)"
             )
-            from lerobot_isaac_deploy.mock_hardware import (
-                run_mock_inference_loop,
-            )
-            rc = run_mock_inference_loop(self.cfg)
+
+            kind = self._ckpt_kind
+            if kind == "lerobot":
+                from lerobot_isaac_deploy.mock_hardware import run_mock_inference_loop
+                rc = run_mock_inference_loop(self.cfg)
+            elif kind == "dreamerv3":
+                from lerobot_isaac_deploy.mock_hardware import run_mock_inference_loop_wm
+                rc = run_mock_inference_loop_wm(self.cfg)
+            else:
+                raise RuntimeError(
+                    f"mock-hardware loop not supported for checkpoint kind "
+                    f"{kind!r}. Supported kinds: lerobot, dreamerv3."
+                )
+
             if rc != 0:
                 raise RuntimeError(f"mock-hardware loop failed rc={rc}")
             ok("mock-hardware loop complete — policy emits actions end-to-end")
@@ -307,6 +349,7 @@ class DeploySession:
         ok("dry-run complete — verify action lines made sense")
 
     def step_execute_tight(self) -> None:
+        self._check_real_ckpt_gate()
         self._confirm(
             f"READY for tight execute? Hand on e-stop. "
             f"{self.cfg.clamp_tight_deg}°/step, {self.cfg.duration_tight_s:.0f}s.",
@@ -332,6 +375,7 @@ class DeploySession:
         ok("tight execute complete — abort here if motion looked wrong")
 
     def step_execute_loose(self) -> None:
+        self._check_real_ckpt_gate()
         self._confirm(
             f"Step 3 OK. Proceed to {self.cfg.clamp_loose_deg}°/step, "
             f"{self.cfg.duration_loose_s:.0f}s?",
@@ -356,6 +400,7 @@ class DeploySession:
         ok("loose execute complete")
 
     def step_closed_loop(self) -> Path:
+        self._check_real_ckpt_gate()
         self._confirm(
             f"Proceed to {self.cfg.n_eval_episodes}-episode closed-loop eval?",
             safety_critical=True,
@@ -444,6 +489,7 @@ class DeploySession:
         )
         info(f"  assume-yes  : {self.cfg.assume_yes}")
         info(f"  mock-hw     : {self.cfg.mock_hardware}")
+        info(f"  require-real-ckpt: {self.cfg.require_real_ckpt}")
 
         try:
             self.step_preflight()
@@ -591,6 +637,11 @@ def build_session_parser() -> argparse.ArgumentParser:
                          "obs inference loop. Incompatible with "
                          "--execute. Use for smoke tests without "
                          "serial port / camera."))
+    p.add_argument("--require-real-ckpt", dest="require_real_ckpt",
+                   action="store_true", default=False,
+                   help=("refuse motor-write steps when the checkpoint "
+                         "contains a synthetic_marker.json test fixture. "
+                         "env: LI_DEPLOY_REQUIRE_REAL_CKPT=1."))
     return p
 
 
@@ -603,6 +654,7 @@ def cfg_from_namespace(ns: argparse.Namespace) -> SessionConfig:
         raise SystemExit("--policy-path or --winner required")
 
     assume_yes = bool(ns.assume_yes) or _env_assume_yes()
+    require_real_ckpt = bool(ns.require_real_ckpt) or _env_require_real_ckpt()
     winner_path = Path(ns.winner) if ns.winner else None
     dataset_root = _resolve_dataset_root(ns.dataset_root, winner_path)
 
@@ -623,4 +675,5 @@ def cfg_from_namespace(ns: argparse.Namespace) -> SessionConfig:
         home_on_exit=bool(ns.home_on_exit),
         assume_yes=assume_yes,
         mock_hardware=bool(ns.mock_hardware),
+        require_real_ckpt=require_real_ckpt,
     )
