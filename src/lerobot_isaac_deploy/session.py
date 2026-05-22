@@ -235,11 +235,13 @@ class DeploySession:
 
         if kind == "lerobot":
             self._ckpt_kind = "lerobot"
+            self._check_real_ckpt_gate()
             return
 
         if kind == "dreamerv3":
             # DreamerV3 is first-class: actor head used for closed-loop deploy.
             self._ckpt_kind = "dreamerv3"
+            self._check_real_ckpt_gate()
             return
 
         if kind == "lewm":
@@ -294,6 +296,14 @@ class DeploySession:
 
     def step_preflight(self) -> None:
         info("STEP 1: preflight (load policy + I/O schema, no motors)")
+        # robot-data-run-check is the LeRobot policy-factory smoke check;
+        # WM checkpoints (DreamerV3 et al.) load via lerobot_isaac_deploy.wm_loader
+        # and have no compatible config.json. Skip the subprocess for non-lerobot
+        # kinds — the kind detection already happened in _validate_inputs and
+        # downstream steps dispatch on self._ckpt_kind.
+        if getattr(self, "_ckpt_kind", "lerobot") != "lerobot":
+            ok(f"preflight skipped — {self._ckpt_kind} ckpt loads via wm_loader, not LeRobot runner")
+            return
         check = self._find_runner_bin("robot-data-run-check")
         rc = subprocess.run(
             [

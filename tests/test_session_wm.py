@@ -40,6 +40,10 @@ def test_validate_inputs_accepts_dreamerv3(tmp_path: Path) -> None:
 
 
 def test_require_real_ckpt_refuses_synthetic_execute(tmp_path: Path) -> None:
+    """Gate fires inside _validate_inputs (before any subprocess) when
+    --require-real-ckpt is set and the ckpt is synthetic. Verification-loop
+    regression fix (2026-05-22): previously placed only inside
+    step_execute_*/step_closed_loop, which step_preflight reached first."""
     cfg = SessionConfig(
         policy_path=_write_synthetic_dreamer(tmp_path),
         dataset_root=_make_dataset(tmp_path),
@@ -47,9 +51,8 @@ def test_require_real_ckpt_refuses_synthetic_execute(tmp_path: Path) -> None:
         assume_yes=True,
     )
     session = DeploySession(cfg)
-    session._validate_inputs()
     with pytest.raises(RuntimeError, match="synthetic test fixture"):
-        session.step_execute_tight()
+        session._validate_inputs()
 
 
 def test_validate_inputs_refuses_vjepa(tmp_path: Path) -> None:
