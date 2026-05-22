@@ -255,25 +255,20 @@ def run_mock_inference_loop_wm(cfg: "SessionConfig") -> int:
 
     Exit codes mirror :func:`run_mock_inference_loop`: 0 clean, 2 load failure, 6 inference failure.
     """
-    import logging
-    import time
-    from pathlib import Path
-
     import numpy as np
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    _logger = logging.getLogger(__name__)
 
     try:
         from lerobot_isaac_deploy.wm_loader import load_dreamerv3
     except ImportError as exc:
-        _logger.error("wm_loader import failed: %s", exc)
+        logger.error("wm_loader import failed: %s", exc)
         return 2
 
     try:
         actor = load_dreamerv3(Path(cfg.policy_path))
     except Exception as exc:  # noqa: BLE001
-        _logger.error("DreamerV3 actor load failed: %s", exc)
+        logger.error("DreamerV3 actor load failed: %s", exc)
         return 2
 
     so101_motors = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
@@ -284,7 +279,7 @@ def run_mock_inference_loop_wm(cfg: "SessionConfig") -> int:
 
     n_steps = max(1, int(cfg.duration_dry_s * cfg.rate_hz))
     dt = 1.0 / cfg.rate_hz if cfg.rate_hz > 0 else 0.0
-    _logger.info("mock-hardware (wm): %d steps @ %.1f Hz task=%r", n_steps, cfg.rate_hz, cfg.task)
+    logger.info("mock-hardware (wm): %d steps @ %.1f Hz task=%r", n_steps, cfg.rate_hz, cfg.task)
 
     rc = 0
     deadline = time.monotonic() + cfg.duration_dry_s
@@ -300,16 +295,16 @@ def run_mock_inference_loop_wm(cfg: "SessionConfig") -> int:
                 action = action.detach().cpu().numpy()
             action = np.asarray(action).reshape(-1)
         except Exception as exc:  # noqa: BLE001
-            _logger.error("wm-mock-hardware: inference failed at step %d: %s", step, exc)
+            logger.error("wm-mock-hardware: inference failed at step %d: %s", step, exc)
             rc = 6
             break
 
         action_dict = {m: float(action[i]) if i < action.size else 0.0 for i, m in enumerate(so101_motors)}
-        _logger.info("mock-wm step %d action=%s", step, {k: round(v, 3) for k, v in action_dict.items()})
+        logger.info("mock-wm step %d action=%s", step, {k: round(v, 3) for k, v in action_dict.items()})
 
         slack = dt - (time.monotonic() - step_start)
         if slack > 0:
             time.sleep(slack)
 
-    _logger.info("mock-hardware (wm): %d step(s) complete (rc=%d)", step + 1, rc)
+    logger.info("mock-hardware (wm): %d step(s) complete (rc=%d)", step + 1, rc)
     return rc

@@ -228,7 +228,9 @@ def _rollout_dreamerv3(
         "horizon": int(horizon),
         "n_seed_episodes": int(n_seeds),
         "synthetic": False,
-        "mean_recon_loss": float("nan"),  # decoder/recon body deferred
+        "partial": True,                  # real ckpt loaded, decoder body deferred
+        "decoder_implemented": False,
+        "mean_recon_loss": float("nan"),  # NaN until decoder lands; gate downstream eval on `partial`
     }
     out_path = out_dir / "rollout_summary.json"
     out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -282,6 +284,8 @@ def _rollout_lewm(
         "horizon": int(horizon),
         "n_seed_episodes": int(n_seeds),
         "synthetic": False,
+        "partial": True,                # deps loaded, real predict body deferred
+        "predictor_implemented": False,
         "mean_pred_loss": float("nan"),
     }
     out_path = out_dir / "rollout_summary.json"
