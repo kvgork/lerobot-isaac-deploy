@@ -101,3 +101,20 @@ def test_cli_dispatch_rejects_unknown(capsys) -> None:
 
     rc = main(["frobnicate"])
     assert rc == 2
+
+
+def test_imports_wm_video():
+    """wm_video.py is importable and exposes three load_* refusers."""
+    from lerobot_isaac_deploy import wm_video
+    assert callable(wm_video.load_vjepa)
+    assert callable(wm_video.load_cosmos)
+    assert callable(wm_video.load_gaia)
+
+
+def test_session_parser_has_require_real_ckpt_flag():
+    """build_session_parser registers --require-real-ckpt."""
+    from lerobot_isaac_deploy.session import build_session_parser
+    parser = build_session_parser()
+    # Walk parser._actions for the dest.
+    dests = {a.dest for a in parser._actions}
+    assert "require_real_ckpt" in dests
