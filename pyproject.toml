@@ -32,6 +32,7 @@ dependencies = [
 lerobot-isaac-deploy = "lerobot_isaac_deploy.cli:main"
 li-deploy-session    = "lerobot_isaac_deploy.cli:session_main"
 li-deploy-sync-ckpt  = "lerobot_isaac_deploy.cli:sync_ckpt_main"
+li-deploy-sync-wm    = "lerobot_isaac_deploy.cli:sync_wm_main"
 li-deploy-sync-eval  = "lerobot_isaac_deploy.cli:sync_eval_main"
 li-deploy-bootstrap  = "lerobot_isaac_deploy.cli:bootstrap_main"
 li-deploy-wm-rollout = "lerobot_isaac_deploy.cli:wm_rollout_main"

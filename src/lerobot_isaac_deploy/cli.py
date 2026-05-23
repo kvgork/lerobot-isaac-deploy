@@ -84,6 +84,31 @@ def bootstrap_main(argv: list[str] | None = None) -> int:
     return _bootstrap(argv)
 
 
+def sync_wm_main(argv: list[str] | None = None) -> int:
+    """`li-deploy-sync-wm` — push a sheeprl WM checkpoint to the laptop.
+
+    Stages the sheeprl run dir into the deploy-format layout that
+    ``detect_policy_kind`` recognises as ``dreamerv3``
+    (``<root>/.hydra/config.yaml`` + ``<root>/checkpoint/ckpt_*.ckpt``)
+    and rsyncs the staged tree to ``<laptop_base>/checkpoints/wm/<label>/``.
+    """
+    from pathlib import Path
+    from lerobot_isaac_deploy.sync import build_sync_wm_parser, sync_wm_ckpt_to_laptop
+
+    ns = build_sync_wm_parser().parse_args(argv)
+    return sync_wm_ckpt_to_laptop(
+        Path(ns.sheeprl_run_dir),
+        hydra_cfg_dir=Path(ns.hydra_cfg_dir),
+        host=ns.host,
+        laptop_base=ns.laptop_base,
+        remote_dir=ns.remote_dir,
+        label=ns.label,
+        metadata_files=[Path(p) for p in ns.metadata] if ns.metadata else None,
+        stage_dir=Path(ns.stage_dir) if ns.stage_dir else None,
+        dry_run=ns.dry_run,
+    )
+
+
 def wm_rollout_main(argv: list[str] | None = None) -> int:
     from lerobot_isaac_deploy.wm_rollout import main as _rollout
 
@@ -112,6 +137,7 @@ _SUBCOMMANDS = {
     "wm-rollout": (wm_rollout_main, "Offline state-prediction rollout (DreamerV3 / LeWM); no robot"),
     "kind":       (kind_main,       "Detect what kind of checkpoint a directory holds"),
     "sync-ckpt":  (sync_ckpt_main,  "Desktop → laptop ckpt sync (run on desktop)"),
+    "sync-wm":    (sync_wm_main,    "Desktop → laptop world-model ckpt sync (run on desktop)"),
     "sync-eval":  (sync_eval_main,  "Laptop → desktop eval JSON pull (run on desktop)"),
     "bootstrap":  (bootstrap_main,  "One-shot laptop env setup"),
 }
