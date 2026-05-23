@@ -116,6 +116,13 @@ class LoadedWMActor:
     device: str
     kind: str = "dreamerv3"
     _state: Any = None  # recurrent hidden state (h, z)
+    # Optional handles set by load_dreamerv3 for downstream rollout / eval use.
+    # `world_model` is sheeprl's full WorldModel (encoder + rssm + decoder +
+    # reward_model + continue_model). `decoder` is the observation decoder.
+    # Both are None for the synthetic stub.
+    world_model: Any = None
+    decoder: Any = None
+    cfg: Any = None  # the resolved cfg dict (dotdict)
 
     def reset(self) -> None:
         """Clear the recurrent state. Call on each new episode."""
@@ -218,33 +225,100 @@ def load_dreamerv3(
             f"hydra config not found at {cfg_path} — sheeprl needs it "
             f"to reconstruct the policy class."
         )
-    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    # Match sheeprl's own loader: OmegaConf.load → resolve interpolations →
+    # to_container → wrap in dotdict. This converts ListConfig/DictConfig to
+    # native Python list/dict so `isinstance(..., list)` checks inside
+    # sheeprl's `make_env` succeed.
+    try:
+        from omegaconf import OmegaConf
+        from sheeprl.utils.utils import dotdict
+        # sheeprl/Hydra configs reference `${now:%Y-%m-%d_%H-%M-%S}` etc.
+        # That resolver lives in `hydra.core.utils.setup_globals()` and is
+        # only installed when Hydra boots. Register it manually here so
+        # `OmegaConf.to_container(resolve=True)` doesn't trip on
+        # `UnsupportedInterpolationType`.
+        try:
+            from hydra.core.utils import setup_globals as _hydra_setup_globals
+            _hydra_setup_globals()
+        except Exception:  # noqa: BLE001
+            from datetime import datetime
+            if not OmegaConf.has_resolver("now"):
+                OmegaConf.register_new_resolver(
+                    "now",
+                    lambda pattern: datetime.now().strftime(pattern),
+                    replace=True,
+                )
+        raw_cfg = OmegaConf.load(str(cfg_path))
+        cfg = dotdict(OmegaConf.to_container(raw_cfg, resolve=True, throw_on_missing=False))
+    except ImportError:
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     state = torch.load(cp, map_location=device, weights_only=False)
 
-    # sheeprl's DreamerV3 keys (subject to sheeprl API drift)
+    # sheeprl 0.5+ DreamerV3 build_agent signature:
+    #   build_agent(fabric, actions_dim, is_continuous, cfg, obs_space,
+    #               world_model_state=None, actor_state=None,
+    #               critic_state=None, target_critic_state=None)
+    # We need a Fabric instance + concrete obs/action spaces from a real
+    # env. Build a single-env vector to extract spaces, then tear it down.
     try:
         from sheeprl.algos.dreamer_v3.agent import build_agent
+        from sheeprl.utils.env import make_env
+        import gymnasium as gym
+        from lightning.fabric import Fabric
     except ImportError as exc:
         raise ImportError(
-            "sheeprl is required to deploy DreamerV3 checkpoints. "
-            "pip install 'sheeprl[dreamer]>=0.5'"
+            "sheeprl + lightning + gymnasium are required to deploy "
+            "DreamerV3 checkpoints. pip install 'sheeprl[dreamer]>=0.5' "
+            "'lightning>=2' gymnasium"
         ) from exc
 
-    agent = build_agent(
-        cfg,
-        obs_space=state.get("obs_space"),
-        action_space=state.get("action_space"),
+    accelerator = "cuda" if device.startswith("cuda") else "cpu"
+    fabric = Fabric(accelerator=accelerator, devices=1)
+    if not fabric._launched:
+        fabric.launch()
+
+    # Instantiate one env to read its observation_space + action_space.
+    env_factory = make_env(cfg, seed=0, rank=0)
+    env = env_factory()
+    observation_space = env.observation_space
+    action_space = env.action_space
+    env.close()
+
+    is_continuous = isinstance(action_space, gym.spaces.Box)
+    is_multidiscrete = isinstance(action_space, gym.spaces.MultiDiscrete)
+    actions_dim = tuple(
+        action_space.shape
+        if is_continuous
+        else (
+            action_space.nvec.tolist()
+            if is_multidiscrete
+            else [action_space.n]
+        )
     )
-    agent.load_state_dict(state["agent"], strict=False)
-    agent.to(device)
-    agent.eval()
+
+    world_model, actor, critic, target_critic, player = build_agent(
+        fabric,
+        actions_dim,
+        is_continuous,
+        cfg,
+        observation_space,
+        state.get("world_model"),
+        state.get("actor"),
+        state.get("critic"),
+        state.get("target_critic"),
+    )
+    world_model.eval()
+    actor.eval()
 
     return LoadedWMActor(
-        actor=agent.actor,
-        encoder=agent.world_model.encoder,
+        actor=actor,
+        encoder=world_model.encoder,
         device=device,
+        world_model=world_model,
+        decoder=getattr(world_model, "observation_model", None) or getattr(world_model, "decoder", None),
+        cfg=cfg,
     )
 
 

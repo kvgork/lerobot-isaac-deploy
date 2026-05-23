@@ -193,44 +193,191 @@ def _rollout_dreamerv3(
             f"or use a synthetic-marker fixture for smoke tests."
         ) from exc
 
-    # Minimal first-iteration body: seed from synthetic obs (no dataset
-    # loader yet), roll the RSSM forward, decode each step, accumulate
-    # reconstructions. A real LeRobotDataset loader is a future commit
-    # tracked in system-improvements.md.
-    seed_obs = {
-        "state": np.zeros((1, 6), dtype=np.float32),
-        "image": np.zeros((1, 3, 64, 64), dtype=np.uint8),
-    }
-    # If `loaded` is the synthetic stub class from wm_loader, just produce zeros.
-    # If it's a real LoadedWMActor, do an honest forward pass.
-    preds = []
-    try:
-        # Best-effort: encode → step → decode `horizon` times.
-        if hasattr(loaded, "encoder") and hasattr(loaded, "actor"):
-            import torch as _t
-            with _t.no_grad():
-                z = loaded.encoder(seed_obs) if callable(loaded.encoder) else None
-                state = loaded.actor.init_state(1, device=loaded.device) if hasattr(loaded.actor, "init_state") else None
-                for _ in range(horizon):
-                    state, _act = loaded.actor.step(z, state) if state is not None else (None, None)
-                    preds.append(np.zeros((3, 64, 64), dtype=np.float32))  # decoder body deferred
-        if not preds:
-            preds = [np.zeros((3, 64, 64), dtype=np.float32) for _ in range(horizon)]
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"DreamerV3 rollout forward failed: {exc}") from exc
+    # Real rollout body — DreamerV3 image reconstruction MSE on held-out
+    # episodes. Two source-of-truth options for held-out frames:
+    #   1. The bridge-produced HDF5 (preferred — already at the right
+    #      image_size/window the WM was trained on).
+    #   2. Raw LeRobotDataset (Parquet). Requires resize + dtype conversion
+    #      to match the encoder's expected shape. Used as fallback.
+    # Strategy: peek at ``ds_root``; if it's an HDF5 file (or a sibling
+    # `*_dreamerv3.hdf5` exists next to it), use option 1. Else fall back.
+    import numpy as np
+    import torch
 
-    arr = np.stack(preds, axis=0)
-    np.savez(out_dir / "next_state_pred.npz", pred=arr)
+    ds_path = Path(ds_root)
+    hdf5_path: Path | None = None
+    if ds_path.is_file() and ds_path.suffix in (".h5", ".hdf5"):
+        hdf5_path = ds_path
+    else:
+        # Look for a sibling bridged HDF5 produced by lerobot_world_model_bridge.
+        wm_data_root = ds_path.parent.parent / "outputs" / "wm_data"
+        if wm_data_root.is_dir():
+            cands = sorted(wm_data_root.glob(f"{ds_path.name}_dreamerv3.hdf5"))
+            if cands:
+                hdf5_path = cands[0]
+
+    if hdf5_path is None or not hdf5_path.is_file():
+        raise RuntimeError(
+            f"DreamerV3 rollout: no bridged HDF5 found. Pass --dataset-root "
+            f"directly to a *_dreamerv3.hdf5 file, or place one at "
+            f"outputs/wm_data/<dataset>_dreamerv3.hdf5 (use the "
+            f"lerobot_world_model_bridge skill to create it)."
+        )
+
+    try:
+        import h5py
+    except ImportError as exc:
+        raise _RolloutInstallError(
+            f"DreamerV3 rollout needs h5py installed. pip install h5py ({exc})"
+        ) from exc
+
+    world_model = loaded.world_model
+    encoder = loaded.encoder
+    decoder = loaded.decoder
+    if world_model is None or decoder is None:
+        raise RuntimeError(
+            "DreamerV3 rollout: loaded actor missing world_model/decoder. "
+            "Update wm_loader.load_dreamerv3 to expose them."
+        )
+    device = loaded.device
+
+    cnn_keys = ["rgb"]
+    try:
+        cnn_keys = list(loaded.cfg["algo"]["cnn_keys"]["encoder"]) or ["rgb"]
+    except Exception:  # noqa: BLE001
+        pass
+    cnn_key = cnn_keys[0]
+
+    losses: list[float] = []
+    n_frames_total = 0
+    preds_first_ep: list[np.ndarray] | None = None
+
+    rssm = world_model.rssm
+    obs_model = world_model.observation_model
+
+    with h5py.File(str(hdf5_path), "r") as f:
+        if "episodes" not in f:
+            raise RuntimeError(
+                f"DreamerV3 rollout: HDF5 {hdf5_path} missing 'episodes' group"
+            )
+        ep_names = sorted(f["episodes"].keys())
+        held_out = ep_names[-max(1, int(n_seeds)):]
+        for ep_name in held_out:
+            ep = f["episodes"][ep_name]
+            frames_np = np.asarray(ep["frames"])  # (T, H, W, 3) uint8
+            actions_np = np.asarray(ep["actions"])  # (T, A) float32
+            if frames_np.size == 0:
+                continue
+            T = min(int(horizon) if horizon > 0 else frames_np.shape[0], frames_np.shape[0])
+            T = min(T, actions_np.shape[0])
+            # Frames: NHWC uint8 → BCHW float in [-0.5, 0.5] (sheeprl default).
+            frames_t = (
+                torch.from_numpy(frames_np[:T])
+                .permute(0, 3, 1, 2)
+                .contiguous()
+                .float()
+                .div_(255.0)
+                .sub_(0.5)
+                .to(device)
+            )  # (T, 3, H, W)
+            actions_t = (
+                torch.from_numpy(actions_np[:T]).float().to(device)
+            )  # (T, A)
+
+            with torch.no_grad():
+                # Encoder consumes a dict with a leading batch dim. Treat T as batch.
+                obs_dict = {cnn_key: frames_t}
+                embedded_obs = encoder(obs_dict)  # (T, embed)
+                # Reshape to (T, B=1, ...).
+                embedded_obs = embedded_obs.unsqueeze(1)  # (T, 1, embed)
+                actions_t = actions_t.unsqueeze(1)        # (T, 1, A)
+                # sheeprl's RSSM does `(1 - is_first) * action`, requiring a
+                # float tensor (bool subtraction is not supported in torch).
+                is_first = torch.zeros(T, 1, 1, dtype=torch.float32, device=device)
+                is_first[0, 0, 0] = 1.0
+
+                # Iterate the RSSM dynamic loop, exactly mirroring
+                # sheeprl/algos/dreamer_v3/dreamer_v3.py lines 124-148.
+                recurrent_state, posterior = rssm.get_initial_states((1, 1))
+                # get_initial_states returns shapes:
+                #   recurrent_state: (1, 1, recurrent_size)
+                #   posterior:       (1, 1, stochastic, discrete) OR flattened
+                recurrent_states = []
+                posteriors_list = []
+                for i in range(T):
+                    recurrent_state, posterior, _prior, _post_logits, _prior_logits = (
+                        rssm.dynamic(
+                            posterior,
+                            recurrent_state,
+                            actions_t[i : i + 1],
+                            embedded_obs[i : i + 1],
+                            is_first[i : i + 1],
+                        )
+                    )
+                    recurrent_states.append(recurrent_state)
+                    posteriors_list.append(posterior)
+                recurrent_states_t = torch.cat(recurrent_states, dim=0)  # (T, 1, R)
+                posteriors_t = torch.cat(posteriors_list, dim=0)         # (T, 1, S, D) or (T, 1, S*D)
+                # Flatten the categorical (stochastic, discrete) axes if present.
+                if posteriors_t.dim() == 4:
+                    posteriors_flat = posteriors_t.view(*posteriors_t.shape[:-2], -1)
+                else:
+                    posteriors_flat = posteriors_t
+                latent_states = torch.cat((posteriors_flat, recurrent_states_t), dim=-1)
+                # (T, 1, S*D + R)
+                rec_dict = obs_model(latent_states)
+                # rec_dict either dict[str, Tensor] or dict[str, Distribution].
+                rec_obj = rec_dict[cnn_key] if isinstance(rec_dict, dict) else rec_dict
+                # sheeprl's CNNDecoder returns plain Tensor; MLPDecoder wraps
+                # in Independent(Normal(...)). Branch by Tensor-ness.
+                if isinstance(rec_obj, torch.Tensor):
+                    rec_img = rec_obj
+                else:
+                    rec_img = None
+                    for attr in ("mode", "mean"):
+                        v = getattr(rec_obj, attr, None)
+                        if v is None:
+                            continue
+                        rec_img = v() if callable(v) else v
+                        if rec_img is not None:
+                            break
+                    if rec_img is None:
+                        raise RuntimeError(
+                            f"DreamerV3 rollout: cannot materialise decoder "
+                            f"output for key '{cnn_key}' (got {type(rec_obj)})"
+                        )
+                # rec_img shape: (T, 1, 3, H, W) — squeeze batch axis.
+                rec_img = rec_img.view(*frames_t.shape)
+                ep_mse = torch.mean((rec_img - frames_t) ** 2).item()
+                losses.append(ep_mse)
+                n_frames_total += T
+                if preds_first_ep is None:
+                    preds_first_ep = rec_img.detach().cpu().numpy()
+
+    if not losses:
+        raise RuntimeError(
+            f"DreamerV3 rollout: no held-out frames found in {hdf5_path}"
+        )
+
+    mean_recon_loss = float(np.mean(losses))
+    if preds_first_ep is None:
+        preds_first_ep = np.zeros((1, 3, 64, 64), dtype=np.float32)
+    np.savez(out_dir / "next_state_pred.npz", pred=preds_first_ep)
+
     summary = {
         "kind": "dreamerv3",
         "checkpoint": str(cp),
         "dataset_root": str(ds_root),
+        "hdf5_path": str(hdf5_path),
         "horizon": int(horizon),
         "n_seed_episodes": int(n_seeds),
+        "n_frames_total": int(n_frames_total),
         "synthetic": False,
-        "partial": True,                  # real ckpt loaded, decoder body deferred
-        "decoder_implemented": False,
-        "mean_recon_loss": float("nan"),  # NaN until decoder lands; gate downstream eval on `partial`
+        "partial": False,
+        "decoder_implemented": True,
+        "mean_recon_loss": mean_recon_loss,
+        "per_episode_recon_loss": losses,
+        "cnn_key": cnn_key,
     }
     out_path = out_dir / "rollout_summary.json"
     out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
