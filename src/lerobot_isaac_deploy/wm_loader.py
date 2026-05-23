@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 class WMDeployNotSupported(RuntimeError):
     """Raised when a checkpoint kind cannot be deployed on hardware."""
@@ -264,7 +266,6 @@ def load_dreamerv3(
     # env. Build a single-env vector to extract spaces, then tear it down.
     try:
         from sheeprl.algos.dreamer_v3.agent import build_agent
-        from sheeprl.utils.env import make_env
         import gymnasium as gym
         from lightning.fabric import Fabric
     except ImportError as exc:
@@ -279,12 +280,42 @@ def load_dreamerv3(
     if not fabric._launched:
         fabric.launch()
 
-    # Instantiate one env to read its observation_space + action_space.
-    env_factory = make_env(cfg, seed=0, rank=0)
-    env = env_factory()
-    observation_space = env.observation_space
-    action_space = env.action_space
-    env.close()
+    # Build observation_space + action_space directly from cfg, bypassing
+    # sheeprl's make_env path. make_env tries to instantiate the training-
+    # time env via Hydra (`env._target_` resolves to e.g.
+    # `lerobot_isaac_adapters.sheeprl_plugin.hdf5_env.get_hdf5_env`) which
+    # would force the deploy laptop to install the training-only adapter
+    # package. We only need the spaces, not a step-able env — and the
+    # spaces are fully captured by cfg.algo.{cnn,mlp}_keys + cfg.env.
+    cnn_keys = list(cfg.get("algo", {}).get("cnn_keys", {}).get("encoder", []) or [])
+    mlp_keys = list(cfg.get("algo", {}).get("mlp_keys", {}).get("encoder", []) or [])
+    env_cfg = cfg.get("env", {})
+    image_size = int(
+        env_cfg.get("image_size")
+        or cfg.get("algo", {}).get("world_model", {}).get("image_size")
+        or 64
+    )
+    # SO-101 has 6 joints — default. Override via cfg.env.action_dim when present.
+    action_dim = int(env_cfg.get("action_dim") or env_cfg.get("num_actions") or 6)
+
+    space_dict: dict[str, Any] = {}
+    for k in cnn_keys:
+        space_dict[k] = gym.spaces.Box(
+            low=0, high=255, shape=(3, image_size, image_size), dtype=np.uint8
+        )
+    for k in mlp_keys:
+        # Most MLP keys in sheeprl configs are 1-D feature vectors; use
+        # action_dim as a sensible default fallback when the cfg doesn't
+        # pin per-key dims. Real cfgs add explicit shapes in env.* — read
+        # them when available.
+        per_key = env_cfg.get(f"{k}_dim") or action_dim
+        space_dict[k] = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(int(per_key),), dtype=np.float32
+        )
+    observation_space = gym.spaces.Dict(space_dict) if space_dict else gym.spaces.Dict()
+    action_space = gym.spaces.Box(
+        low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32
+    )
 
     is_continuous = isinstance(action_space, gym.spaces.Box)
     is_multidiscrete = isinstance(action_space, gym.spaces.MultiDiscrete)
