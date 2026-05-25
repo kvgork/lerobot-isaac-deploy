@@ -33,12 +33,17 @@ SO101_JOINT_NAMES = [
 ]
 
 
-def open_arm(port: str, calibration_dir: str | None = None):  # noqa: ARG001
+def open_arm(
+    port: str,
+    calibration_dir: str | None = None,  # noqa: ARG001
+    max_relative_target: float = 5.0,
+):
     """Open SO-101 follower on port in read-only mode.
 
     Returns a robot handle that exposes:
         .get_observation()  -> dict
         .disconnect()
+        .send_action(dict)  (used by motor-write paths)
 
     The robot is connected with ``calibrate=False`` — never recalibrate
     from a deploy session; calibration belongs in a dedicated setup flow.
@@ -51,6 +56,14 @@ def open_arm(port: str, calibration_dir: str | None = None):  # noqa: ARG001
         Ignored (accepted for API symmetry with future callers). The
         SO101FollowerConfig does not accept an external calibration_dir
         in lerobot 0.5 — calibration is embedded in the port config.
+    max_relative_target:
+        Server-side per-step position clamp in degrees (arm joints) or
+        % (gripper). SO101Follower refuses any single Goal_Position that
+        is more than this value away from the current position. This is a
+        second-layer safety guard complementing the client-side clamp in
+        arm_motor_writer.compute_targets(). Set to the same value as
+        max_step_deg in the deploy loop so both layers agree.
+        Default 5.0 is conservative for initial wiring validation.
 
     Raises
     ------
@@ -71,6 +84,7 @@ def open_arm(port: str, calibration_dir: str | None = None):  # noqa: ARG001
     follower_cfg = SO101FollowerConfig(
         port=port,
         id="so101",
+        max_relative_target=max_relative_target,
     )
     robot = SO101Follower(follower_cfg)
     robot.connect(calibrate=False)

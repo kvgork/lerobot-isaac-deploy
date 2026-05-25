@@ -70,19 +70,26 @@ motor-write loop implemented in
 
     1. Loads the DreamerV3 actor via
        :func:`lerobot_isaac_deploy.wm_loader.load_dreamerv3`.
-    2. Opens the real SO-101 at ``cfg.port``.
+    2. Opens the real SO-101 at ``cfg.port`` with
+       ``max_relative_target=max_step_deg`` (server-side clamp).
     3. Reads joint-position calibration limits (falls back to hardcoded
        conservative defaults — see arm_motor_writer module docstring).
+       Cal-derived limits are always a STRICT SUBSET of the hardcoded
+       safety floor.
     4. Runs a rate-limited loop at ``cfg.rate_hz`` for ``duration_s``:
        a. Read obs via ``robot.get_observation()``.
-       b. Build state = [joint_pos(6) | obj_pose_dummy(7)].
-       c. Call ``actor.select_action(obs)``.
-       d. Compute targets: current + action * max_step_deg (per-joint),
-          clamped to calibration limits.
-       e. Write targets via ``robot.send_action({<joint>.pos: ...})``.
-       f. Log: jp, action, targets — operator can verify clamp effect.
-    5. home-on-exit always fires on normal/interrupt/exception exit.
-    6. KeyboardInterrupt triggers immediate home + disconnect.
+       b. Validate joint positions — skip step on non-finite or
+          implausible values rather than writing bad motor targets.
+       c. Build state = [joint_pos(6) | obj_pose_dummy(7)].
+       d. Call ``actor.select_action(obs)``.
+       e. Compute targets: current + action * max_step_deg (per-joint),
+          clipped to [-1, 1] BEFORE scaling, then clamped to calibration
+          limits (intersected with hardcoded floor).
+       f. Write targets via ``robot.send_action({<joint>.pos: ...})``.
+       g. Log: jp, action, targets — operator can verify clamp effect.
+    5. home-on-exit uses RAMPED return via arm_motor_writer.ramped_home()
+       rather than an instant single-write to avoid high-velocity slam.
+    6. KeyboardInterrupt triggers immediate ramped home + disconnect.
 
 WARNING: the deployed ckpt is likely unconverged. Saturated actions
 (±1.0) will cause the arm to jitter at clamp-max-deg per step. This is
@@ -484,6 +491,18 @@ class DeploySession:
         clamp_tight_deg) and ``step_execute_loose`` (max_step_deg =
         clamp_loose_deg) to avoid code duplication.
 
+        Safety layers (in order of application):
+          1. Per-step joint-pos validation — skip step on non-finite or
+             implausible values (Fix #6).
+          2. Action clip to [-1, 1] in compute_targets() before scaling
+             (Fix #1).
+          3. Cal-derived joint limits intersected with hardcoded floor
+             (Fix #2/#3).
+          4. Server-side max_relative_target == max_step_deg passed to
+             open_arm() (Fix #5).
+          5. Ramped home on exit — no instant goto from arbitrary pose
+             (Fix #4).
+
         Parameters
         ----------
         duration_s:
@@ -492,6 +511,7 @@ class DeploySession:
             Maximum per-step delta in degrees for arm joints (0..4).
             Gripper delta is always capped at 5.0% regardless of this
             value — gripper needs a separate slower scale.
+            Also used as the server-side max_relative_target clamp.
         step_label:
             Short label for log messages, e.g. "tight" or "loose".
         """
@@ -503,7 +523,7 @@ class DeploySession:
         )
         from lerobot_isaac_deploy.arm_motor_writer import (
             compute_targets,
-            home_targets,
+            ramped_home,
             read_joint_limits,
             write_targets,
         )
@@ -528,10 +548,17 @@ class DeploySession:
             ) or {}
         image_size = int(env_cfg.get("image_size") or 64)
 
-        robot = open_arm(self.cfg.port)
+        # Fix #5: pass max_step_deg as server-side clamp so the follower
+        # refuses any single Goal_Position more than max_step_deg away
+        # from current — double-locking with compute_targets()'s clamp.
+        robot = open_arm(self.cfg.port, max_relative_target=max_step_deg)
         step = 0
+        rate_hz = float(getattr(self.cfg, "rate_hz", 30.0))
+        dt = 1.0 / rate_hz
+
         try:
-            # Read joint limits from calibration; falls back to hardcoded floor.
+            # Read joint limits from calibration; cal-derived limits are
+            # intersected with the hardcoded safety floor in read_joint_limits().
             jmin, jmax = read_joint_limits(robot)
 
             # Object pose is unknown on real arm — zero position + identity quat.
@@ -539,8 +566,6 @@ class DeploySession:
             obj_pose_dummy = np.zeros(7, dtype=np.float32)
             obj_pose_dummy[3] = 1.0  # w component of identity quaternion
 
-            rate_hz = float(getattr(self.cfg, "rate_hz", 30.0))
-            dt = 1.0 / rate_hz
             t_end = time.monotonic() + duration_s
 
             try:
@@ -550,6 +575,30 @@ class DeploySession:
                     # Read current joint positions.
                     obs_dict = robot.get_observation()
                     jp = _extract_joint_pos(obs_dict)
+
+                    # Fix #6: validate current joint positions before use.
+                    # Skip the step (no motor write) on bad sensor data.
+                    if not np.isfinite(jp).all():
+                        info(f"WARN: non-finite joint pos {jp.tolist()}; skipping step {step}")
+                        step += 1
+                        elapsed = time.monotonic() - t0
+                        if elapsed < dt:
+                            time.sleep(dt - elapsed)
+                        continue
+                    if (np.abs(jp[:5]) > 180.0).any():
+                        info(f"WARN: implausible joint pos {jp.tolist()}; skipping step {step}")
+                        step += 1
+                        elapsed = time.monotonic() - t0
+                        if elapsed < dt:
+                            time.sleep(dt - elapsed)
+                        continue
+                    if jp[5] < -10.0 or jp[5] > 110.0:
+                        info(f"WARN: gripper out of range {jp[5]}; skipping step {step}")
+                        step += 1
+                        elapsed = time.monotonic() - t0
+                        if elapsed < dt:
+                            time.sleep(dt - elapsed)
+                        continue
 
                     # Build actor observation.
                     state = np.concatenate([jp, obj_pose_dummy]).astype(np.float32)
@@ -563,7 +612,8 @@ class DeploySession:
                     action = actor.select_action(obs)
                     action = np.asarray(action, dtype=np.float32).reshape(-1)
 
-                    # Compute clamped targets.
+                    # Compute clamped targets (Fix #1: action clipped to [-1,1]
+                    # inside compute_targets before scaling).
                     targets = compute_targets(
                         jp,
                         action,
@@ -593,14 +643,16 @@ class DeploySession:
                 info("KeyboardInterrupt — homing arm before disconnect")
 
         finally:
-            # home-on-exit always fires on normal / interrupt / exception exit.
+            # Fix #4: ramped home on exit — replace instant single-write with
+            # a gradual ramp to avoid high-velocity slam from arbitrary pose.
             if self.cfg.home_on_exit:
                 try:
-                    info("home-on-exit: sending zero targets")
-                    home_targets(robot)
-                    time.sleep(0.5)
+                    obs = robot.get_observation()
+                    cur = _extract_joint_pos(obs)
+                    ramped_home(robot, cur, max_step_deg=max_step_deg, rate_hz=rate_hz)
+                    info("ramped home complete")
                 except Exception as exc:  # noqa: BLE001
-                    warn(f"home-on-exit failed: {exc}")
+                    warn(f"ramped home failed: {exc}")
             try:
                 robot.disconnect()
             except Exception:  # noqa: BLE001

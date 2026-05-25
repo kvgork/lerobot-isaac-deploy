@@ -10,6 +10,10 @@ Action mapping (normalized actor output → motor target):
   - For gripper (5): target = current_pos + a[5] * max_step_gripper_pct
     (gripper has its own RANGE_0_100 norm mode)
   - Targets are clamped to per-joint safe ranges before write
+  - SAFETY: actions are clipped to [-1, 1] BEFORE scaling so that a
+    saturated/pathological actor head (e.g. raw logits, unconverged
+    DreamerV3) cannot produce unbounded per-step motion regardless of
+    max_step_deg.
 
 Motor-write API (verified from robot-data-runner/runner.py line 140):
   robot.send_action({"<joint>.pos": float, ...})
@@ -18,12 +22,15 @@ Motor-write API (verified from robot-data-runner/runner.py line 140):
   max_relative_target clamping server-side (configured at robot init) AND
   accepts the per-motor goal positions in one call.
 
-Joint-limit clamping strategy:
-  robot.calibration is not reliably accessible or in degrees via the
-  public SO101Follower API in lerobot 0.5. We therefore use hardcoded
-  safe ranges as the first-pass safety floor. These are conservative
-  bounds that avoid mechanical hard-stops on the SO-101. Tighten with
-  real per-robot calibration data once available.
+Joint-limit clamping strategy (two-layer):
+  Layer 1 — action clip: action is clipped to [-1, 1] before scaling so
+    per-step motion is bounded by max_step_deg regardless of upstream bugs.
+  Layer 2 — cal-derived limits intersected with hardcoded floor: the
+    calibration-derived limits are constrained to be a STRICT SUBSET of
+    the hardcoded safety floor (_DEFAULT_JOINT_LIMITS_MIN/MAX). A symmetric
+    calibration (ticks 0..4095 → ±180°) can NEVER widen the safe range
+    beyond the hardcoded floor. The elbow_flex -10° table-avoidance floor
+    is preserved even when calibration returns ±90°.
 
   Default hardcoded ranges (degrees / gripper %):
     shoulder_pan   : [-90,  90]
@@ -35,10 +42,17 @@ Joint-limit clamping strategy:
 
   These are labeled FIRST-PASS SAFETY FLOOR — tighten with real
   calibration data once measured.
+
+Ramped home:
+  home-on-exit uses ramped_home() rather than the old single-shot
+  home_targets() so the arm never receives an instant goto from an
+  arbitrary pose — which risks high-velocity slam if the server-side
+  max_relative_target is not independently clamped.
 """
 
 from __future__ import annotations
 
+import time as _time
 from typing import Any
 
 import numpy as np
@@ -57,6 +71,8 @@ SO101_JOINT_NAMES = [
 # FIRST-PASS SAFETY FLOOR — conservative per-joint bounds.
 # Arm joints (0..4) in degrees. Gripper (5) in RANGE_0_100 (%).
 # Tighten with real calibration data once available.
+# Cal-derived limits from read_joint_limits() are always intersected
+# with these values — they can only be TIGHTER, never wider.
 _DEFAULT_JOINT_LIMITS_MIN = np.array(
     [-90.0, -90.0, -10.0, -90.0, -90.0, 0.0], dtype=np.float32
 )
@@ -79,6 +95,11 @@ def compute_targets(
         target[i] = current[i] + action[i] * max_step  (per-joint)
 
     Then clamps to [joint_min[i], joint_max[i]].
+
+    SAFETY: action is clipped to [-1, 1] BEFORE scaling. If the actor
+    head ever emits raw logits, NaN, or values outside [-1, 1], the clip
+    ensures per-step motion is bounded by max_step_deg. NaN / inf values
+    raise ValueError immediately (do not silently corrupt the target).
 
     Parameters
     ----------
@@ -104,16 +125,27 @@ def compute_targets(
     -------
     np.ndarray
         Shape (6,) float32. Clamped joint position targets.
+
+    Raises
+    ------
+    ValueError
+        When action contains NaN or infinite values.
     """
     current = np.asarray(current_jp, dtype=np.float32).reshape(6)
-    act = np.asarray(action, dtype=np.float32).reshape(6)
+    action = np.asarray(action, dtype=np.float32)
+    # Pathology guard: if the actor head ever emits raw logits or NaN,
+    # per-step motion is unbounded. Clip BEFORE scaling so the per-step
+    # bound is mathematically guaranteed regardless of upstream bugs.
+    if not np.isfinite(action).all():
+        raise ValueError(f"action contains non-finite values: {action!r}")
+    action = np.clip(action, -1.0, 1.0).reshape(6)
 
     targets = np.empty(6, dtype=np.float32)
     # Arm joints 0..4: scale by max_step_deg
     for i in range(5):
-        targets[i] = current[i] + act[i] * float(max_step_deg)
+        targets[i] = current[i] + action[i] * float(max_step_deg)
     # Gripper joint 5: scale by max_step_gripper_pct
-    targets[5] = current[5] + act[5] * float(max_step_gripper_pct)
+    targets[5] = current[5] + action[5] * float(max_step_gripper_pct)
 
     # Clamp to joint limits (fall back to hardcoded defaults)
     lo = (
@@ -175,6 +207,12 @@ def home_targets(
     upright neutral pose. For the gripper this is fully closed — safe
     resting position between runs.
 
+    .. deprecated::
+        Prefer :func:`ramped_home` for deploy sessions. ``home_targets``
+        sends an instant goto which risks high-velocity slam from an
+        arbitrary pose if the server-side max_relative_target is not
+        independently clamped. Kept for backwards compat and testing.
+
     Parameters
     ----------
     robot:
@@ -182,6 +220,80 @@ def home_targets(
     """
     home_dict = {f"{name}.pos": 0.0 for name in SO101_JOINT_NAMES}
     robot.send_action(home_dict)
+
+
+def ramped_home(
+    robot: Any,
+    current_jp: np.ndarray,
+    home_pose: np.ndarray | None = None,
+    max_step_deg: float = 1.0,
+    rate_hz: float = 30.0,
+    settle_timeout_s: float = 5.0,
+) -> None:
+    """Ramp arm from current_jp to home_pose (default zeros) at max_step_deg per step.
+
+    Each iteration computes a target one step closer to home along each
+    joint, sleeps 1/rate_hz, then re-reads joint state to detect arrival
+    or stall. Terminates when |jp - home| < tolerance for all joints OR
+    settle_timeout_s elapses.
+
+    This replaces the prior single-shot home_targets(0.0) which sent an
+    instant goto target from arbitrary pose — risk of high-velocity slam
+    if motors aren't independently clamped server-side.
+
+    Parameters
+    ----------
+    robot:
+        SO101Follower handle (already connected). Must expose
+        ``get_observation() -> dict`` and ``send_action(dict)``.
+    current_jp:
+        Shape (6,) float32. Current joint positions at the start of the
+        ramp. Used as the initial position estimate — subsequent steps
+        re-read from the robot.
+    home_pose:
+        Shape (6,) float32. Target home pose in degrees (arm) / % (gripper).
+        Defaults to zeros (all joints at neutral / gripper closed).
+    max_step_deg:
+        Maximum per-step delta in degrees for arm joints (0..4).
+        Gripper steps are capped at 5.0%/step regardless of this value.
+    rate_hz:
+        Control loop frequency in Hz. Default 30 Hz.
+    settle_timeout_s:
+        Maximum wall-clock seconds to wait before giving up. Default 5 s.
+    """
+    from lerobot_isaac_deploy.arm_state_reader import _extract_joint_pos
+
+    if home_pose is None:
+        home_pose = np.zeros(6, dtype=np.float32)
+    home_pose = np.asarray(home_pose, dtype=np.float32).reshape(6)
+
+    dt = 1.0 / rate_hz
+    t_end = _time.monotonic() + settle_timeout_s
+
+    while _time.monotonic() < t_end:
+        # Re-read current state.
+        obs = robot.get_observation()
+        jp = _extract_joint_pos(obs)
+
+        delta = home_pose - jp
+        # Settle check: tighter tol for arm joints, looser for gripper.
+        if (np.abs(delta[:5]) < 2.0).all() and abs(delta[5]) < 5.0:
+            return
+
+        # Step toward home, capped at max_step_deg per joint (arm), 5%/step gripper.
+        step = np.clip(delta[:5], -max_step_deg, max_step_deg)
+        gripper_step = np.clip(delta[5], -5.0, 5.0)
+        target = np.zeros(6, dtype=np.float32)
+        target[:5] = jp[:5] + step
+        target[5] = jp[5] + gripper_step
+
+        # Write target (no exception propagation — best-effort).
+        try:
+            write_targets(robot, target)
+        except Exception:  # noqa: BLE001
+            pass
+
+        _time.sleep(dt)
 
 
 def read_joint_limits(robot: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -200,6 +312,11 @@ def read_joint_limits(robot: Any) -> tuple[np.ndarray, np.ndarray]:
     safety floor (_DEFAULT_JOINT_LIMITS_MIN / _MAX) and logs a warning
     to stdout. Callers MUST treat the returned limits as the minimum
     safety constraint and may tighten them further.
+
+    SAFETY: the cal-derived limits are INTERSECTED with the hardcoded
+    floor after conversion. A symmetric calibration (ticks 0..4095 →
+    ±180°) MUST NOT widen the safe range beyond the floor. The
+    elbow_flex -10° table-avoidance floor is always preserved.
 
     Parameters
     ----------
@@ -234,4 +351,11 @@ def read_joint_limits(robot: Any) -> tuple[np.ndarray, np.ndarray]:
             except (TypeError, ValueError):
                 # Conversion failed — keep hardcoded default for this joint.
                 pass
+
+    # Make cal-derived limits a STRICT subset of the hardcoded floor.
+    # A symmetric cal (ticks 0..4095 → ±180°) MUST NOT widen the safe range.
+    # Also preserves the elbow_flex -10° table-avoidance floor when cal
+    # returns symmetric ranges.
+    min_arr = np.maximum(min_arr, _DEFAULT_JOINT_LIMITS_MIN)
+    max_arr = np.minimum(max_arr, _DEFAULT_JOINT_LIMITS_MAX)
     return min_arr, max_arr

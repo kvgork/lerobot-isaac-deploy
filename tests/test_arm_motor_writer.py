@@ -5,6 +5,7 @@ All tests use mocks — no hardware required. Covers:
   - write_targets: correct robot.send_action() call shape
   - home_targets: correct zero-position dict sent to robot
   - read_joint_limits: calibration parsing + hardcoded fallback
+  - safety: action clip, NaN rejection, cal-floor intersection, ramped_home
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from lerobot_isaac_deploy.arm_motor_writer import (
     _DEFAULT_JOINT_LIMITS_MIN,
     compute_targets,
     home_targets,
+    ramped_home,
     read_joint_limits,
     write_targets,
 )
@@ -329,9 +331,15 @@ class TestReadJointLimits:
             for name in SO101_JOINT_NAMES
         }
         lo, hi = read_joint_limits(robot)
+        # Cal gives ±90°, but limits are intersected with hardcoded floor.
+        # Most joints: lo=-90°, hi=90°. Exceptions:
+        #   elbow_flex (idx 2): lo=-10° (table-avoidance floor).
+        #   gripper (idx 5): lo=0% (floor), hi=90% (cal max < floor max 100%).
+        expected_lo = [-90.0, -90.0, -10.0, -90.0, -90.0, 0.0]
+        expected_hi = [90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
         for i in range(6):
-            assert lo[i] == pytest.approx(-90.0, abs=0.5)
-            assert hi[i] == pytest.approx(90.0, abs=0.5)
+            assert lo[i] == pytest.approx(expected_lo[i], abs=0.5), f"lo[{i}] wrong"
+            assert hi[i] == pytest.approx(expected_hi[i], abs=0.5), f"hi[{i}] wrong"
 
     def test_returns_float32_arrays(self) -> None:
         """read_joint_limits always returns float32 arrays."""
@@ -474,3 +482,92 @@ def test_step_execute_loose_no_longer_raises_not_implemented(tmp_path: Any) -> N
             max_step_deg=cfg.clamp_loose_deg,
             step_label="loose",
         )
+
+
+# ---------------------------------------------------------------------------
+# Safety fixes — 4 new tests (code review b4d3d0e)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_targets_clamps_actor_above_one() -> None:
+    """Saturated/pathological action >1.0 must be clipped before scaling."""
+    cur = np.zeros(6, dtype=np.float32)
+    bad_action = np.array([10.0, -10.0, 5.0, -3.0, 1.5, -1.5], dtype=np.float32)
+    t = compute_targets(cur, bad_action, max_step_deg=3.0, max_step_gripper_pct=5.0)
+    # All arm targets capped at ±3° (max_step_deg * clipped action)
+    assert np.allclose(t[:5], [3.0, -3.0, 3.0, -3.0, 3.0])
+    # Gripper: action -1.5 clips to -1.0, step = -1.0*5.0 = -5.0 from 0.0 = -5.0,
+    # then clamped to gripper floor 0.0%. Correct result is 0.0.
+    assert np.isclose(t[5], 0.0)
+
+
+def test_compute_targets_rejects_nan_action() -> None:
+    """NaN/inf in action must raise, not silently corrupt target."""
+    cur = np.zeros(6, dtype=np.float32)
+    with pytest.raises(ValueError, match="non-finite"):
+        compute_targets(cur, np.array([np.nan] * 6, dtype=np.float32), max_step_deg=1.0)
+    with pytest.raises(ValueError, match="non-finite"):
+        compute_targets(cur, np.array([np.inf] * 6, dtype=np.float32), max_step_deg=1.0)
+
+
+def test_read_joint_limits_never_wider_than_hardcoded_floor() -> None:
+    """Symmetric cal returning ±180° must not weaken the ±90° safety floor."""
+    class _MockCal:
+        def __init__(self, mn: int, mx: int) -> None:
+            self.range_min = mn
+            self.range_max = mx
+
+    class _MockRobot:
+        def __init__(self) -> None:
+            # Cal that would imply ±180° if used naively (ticks 0..4095)
+            self.calibration = {
+                n: _MockCal(0, 4095) for n in SO101_JOINT_NAMES
+            }
+
+    lo, hi = read_joint_limits(_MockRobot())
+    # Cal-derived MUST be INSIDE the hardcoded floor (subset).
+    assert (lo >= _DEFAULT_JOINT_LIMITS_MIN).all(), (
+        f"lo {lo} weakens floor {_DEFAULT_JOINT_LIMITS_MIN}"
+    )
+    assert (hi <= _DEFAULT_JOINT_LIMITS_MAX).all(), (
+        f"hi {hi} weakens floor {_DEFAULT_JOINT_LIMITS_MAX}"
+    )
+    # elbow_flex (idx 2) must keep the -10° table-avoidance floor
+    assert lo[2] >= -10.0
+
+
+def test_ramped_home_terminates_when_close() -> None:
+    """ramped_home should return when |jp - home| < tolerance."""
+    import time as _time
+
+    class _MockBus:
+        def __init__(self) -> None:
+            self.writes: list = []
+
+    class _MockRobot:
+        def __init__(self) -> None:
+            self.calibration: dict = {}
+            self.bus = _MockBus()
+            self._calls = 0
+
+        def get_observation(self) -> dict:
+            self._calls += 1
+            # Already at home pose
+            return {f"{n}.pos": 0.0 for n in SO101_JOINT_NAMES}
+
+        def send_action(self, action_dict: dict) -> None:
+            self.bus.writes.append(action_dict)
+
+    robot = _MockRobot()
+    t0 = _time.monotonic()
+    ramped_home(
+        robot,
+        np.zeros(6, dtype=np.float32),
+        max_step_deg=1.0,
+        rate_hz=60.0,
+        settle_timeout_s=2.0,
+    )
+    elapsed = _time.monotonic() - t0
+    # Should return immediately because already at home (no writes needed)
+    assert elapsed < 0.5
+    assert len(robot.bus.writes) == 0  # no step needed
