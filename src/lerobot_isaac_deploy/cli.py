@@ -115,6 +115,18 @@ def wm_rollout_main(argv: list[str] | None = None) -> int:
     return _rollout(argv)
 
 
+def wm_dryrun_main(argv: list[str] | None = None) -> int:
+    """`lerobot-isaac-deploy wm-dryrun` — dry-run DreamerV3 actor on synthetic obs.
+
+    Loads a sheeprl checkpoint, feeds N random observations through the actor,
+    prints per-joint action statistics, and writes a report.json.
+    No hardware, no camera, no serial port required.
+    """
+    from lerobot_isaac_deploy.wm_dryrun import main as _dryrun
+
+    return _dryrun(argv)
+
+
 def kind_main(argv: list[str] | None = None) -> int:
     """`lerobot-isaac-deploy kind <PATH>` — print detected ckpt kind."""
     import sys
@@ -135,6 +147,7 @@ def kind_main(argv: list[str] | None = None) -> int:
 _SUBCOMMANDS = {
     "session":    (session_main,    "Run the confirm-gated deploy ladder (LeRobot or DreamerV3-actor)"),
     "wm-rollout": (wm_rollout_main, "Offline state-prediction rollout (DreamerV3 / LeWM); no robot"),
+    "wm-dryrun":  (wm_dryrun_main,  "DreamerV3 actor dry-run: load ckpt + run N synthetic obs; no robot"),
     "kind":       (kind_main,       "Detect what kind of checkpoint a directory holds"),
     "sync-ckpt":  (sync_ckpt_main,  "Desktop → laptop ckpt sync (run on desktop)"),
     "sync-wm":    (sync_wm_main,    "Desktop → laptop world-model ckpt sync (run on desktop)"),

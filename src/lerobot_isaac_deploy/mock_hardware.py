@@ -248,19 +248,29 @@ def run_mock_inference_loop_wm(cfg: "SessionConfig") -> int:
     """Mock-hardware loop for a DreamerV3 actor head (or synthetic stub).
 
     Mirrors :func:`run_mock_inference_loop` but skips the lerobot
-    policy-factory path. Loads via :func:`lerobot_isaac_deploy.wm_loader.load_dreamerv3`,
-    synthesises 6-DOF SO-101 state + a single 64x64x3 image observation,
-    iterates ``cfg.duration_dry_s * cfg.rate_hz`` steps, prints the
-    action vector each step.
+    policy-factory path. Loads via
+    :func:`lerobot_isaac_deploy.wm_loader.load_dreamerv3`, synthesises
+    SO-101 state + image observations using the actual encoder key names
+    from the checkpoint config, iterates ``cfg.duration_dry_s *
+    cfg.rate_hz`` steps, prints the action vector each step.
 
-    Exit codes mirror :func:`run_mock_inference_loop`: 0 clean, 2 load failure, 6 inference failure.
+    Key names and state dimensionality are read from the loaded actor:
+    * CNN keys come from ``actor.cnn_keys`` (e.g. ``["rgb"]``)
+    * State dim comes from ``actor.world_model.encoder`` weight shape
+      (or defaults to 13 for SO-101 Isaac with joint_pos + object_pose)
+
+    This ensures the synthetic observation matches what the encoder
+    expects, preventing silent key-mismatch failures.
+
+    Exit codes mirror :func:`run_mock_inference_loop`: 0 clean, 2 load
+    failure, 6 inference failure.
     """
     import numpy as np
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     try:
-        from lerobot_isaac_deploy.wm_loader import load_dreamerv3
+        from lerobot_isaac_deploy.wm_loader import load_dreamerv3, _state_dim_from_weights
     except ImportError as exc:
         logger.error("wm_loader import failed: %s", exc)
         return 2
@@ -271,15 +281,47 @@ def run_mock_inference_loop_wm(cfg: "SessionConfig") -> int:
         logger.error("DreamerV3 actor load failed: %s", exc)
         return 2
 
-    so101_motors = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-    obs = {
-        "state": np.zeros((6,), dtype=np.float32),
-        "image": np.zeros((3, 64, 64), dtype=np.uint8),
+    # Derive obs schema from actor config — do NOT hardcode key names.
+    # cnn_keys: e.g. ["rgb"] from actor.cnn_keys.
+    # state_dim: read from encoder weights when available, else default 13.
+    cnn_keys = list(getattr(actor, "cnn_keys", ["rgb"]) or ["rgb"])
+    state_dim = 13  # default: SO-101 joint_pos[6] + object_pose[7]
+    wm = getattr(actor, "world_model", None)
+    if wm is not None:
+        # Try to read from world_model weights (available on real ckpt).
+        try:
+            wm_sd = {k: v for k, v in wm.state_dict().items()}
+            sd = _state_dim_from_weights(
+                {f"encoder.mlp_encoder.model._model.0.weight": wm_sd.get("encoder.mlp_encoder.model._model.0.weight")}
+            )
+            if sd is not None:
+                state_dim = sd
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Build synthetic obs dict with correct keys.
+    image_size = 64
+    env_cfg = {}
+    if hasattr(actor, "cfg") and actor.cfg is not None:
+        env_cfg = (actor.cfg.get("env") if hasattr(actor.cfg, "get") else {}) or {}
+    image_size = int(env_cfg.get("image_size") or 64)
+
+    obs: dict[str, Any] = {
+        "state": np.zeros((state_dim,), dtype=np.float32),
     }
+    for k in cnn_keys:
+        obs[k] = np.zeros((3, image_size, image_size), dtype=np.uint8)
+
+    so101_motors = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+    action_dim = getattr(actor, "action_dim", 6)
 
     n_steps = max(1, int(cfg.duration_dry_s * cfg.rate_hz))
     dt = 1.0 / cfg.rate_hz if cfg.rate_hz > 0 else 0.0
-    logger.info("mock-hardware (wm): %d steps @ %.1f Hz task=%r", n_steps, cfg.rate_hz, cfg.task)
+    logger.info(
+        "mock-hardware (wm): %d steps @ %.1f Hz task=%r | "
+        "state_dim=%d cnn_keys=%s action_dim=%d",
+        n_steps, cfg.rate_hz, cfg.task, state_dim, cnn_keys, action_dim,
+    )
 
     rc = 0
     deadline = time.monotonic() + cfg.duration_dry_s
@@ -290,16 +332,16 @@ def run_mock_inference_loop_wm(cfg: "SessionConfig") -> int:
         step_start = time.monotonic()
         try:
             action = actor.select_action(obs)
-            # Normalise to ndarray
-            if hasattr(action, "detach"):
-                action = action.detach().cpu().numpy()
-            action = np.asarray(action).reshape(-1)
+            action = np.asarray(action, dtype=np.float32).reshape(-1)
         except Exception as exc:  # noqa: BLE001
             logger.error("wm-mock-hardware: inference failed at step %d: %s", step, exc)
             rc = 6
             break
 
-        action_dict = {m: float(action[i]) if i < action.size else 0.0 for i, m in enumerate(so101_motors)}
+        action_dict = {
+            m: float(action[i]) if i < action.size else 0.0
+            for i, m in enumerate(so101_motors)
+        }
         logger.info("mock-wm step %d action=%s", step, {k: round(v, 3) for k, v in action_dict.items()})
 
         slack = dt - (time.monotonic() - step_start)
