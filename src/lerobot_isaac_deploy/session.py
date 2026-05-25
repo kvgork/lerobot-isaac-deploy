@@ -61,10 +61,33 @@ When ``_ckpt_kind == "dreamerv3"`` and ``--mock-hardware`` is NOT set,
     5. Calls ``actor.select_action(obs)`` and logs the action vector.
        NEVER writes to motors.
 
-The execute steps (step 3 and 4) are NOT yet implemented for DreamerV3
-checkpoints. A ``NotImplementedError`` with an actionable message is
-raised if attempted. Convert the checkpoint to a LeRobot policy format
-or wait for the ``arm_motor_writer`` implementation.
+DreamerV3 execute paths (Path C — tight + loose)
+-------------------------------------------------
+When ``_ckpt_kind == "dreamerv3"`` and ``--execute`` is set,
+``step_execute_tight`` and ``step_execute_loose`` use an in-process
+motor-write loop implemented in
+:func:`lerobot_isaac_deploy.arm_motor_writer`:
+
+    1. Loads the DreamerV3 actor via
+       :func:`lerobot_isaac_deploy.wm_loader.load_dreamerv3`.
+    2. Opens the real SO-101 at ``cfg.port``.
+    3. Reads joint-position calibration limits (falls back to hardcoded
+       conservative defaults — see arm_motor_writer module docstring).
+    4. Runs a rate-limited loop at ``cfg.rate_hz`` for ``duration_s``:
+       a. Read obs via ``robot.get_observation()``.
+       b. Build state = [joint_pos(6) | obj_pose_dummy(7)].
+       c. Call ``actor.select_action(obs)``.
+       d. Compute targets: current + action * max_step_deg (per-joint),
+          clamped to calibration limits.
+       e. Write targets via ``robot.send_action({<joint>.pos: ...})``.
+       f. Log: jp, action, targets — operator can verify clamp effect.
+    5. home-on-exit always fires on normal/interrupt/exception exit.
+    6. KeyboardInterrupt triggers immediate home + disconnect.
+
+WARNING: the deployed ckpt is likely unconverged. Saturated actions
+(±1.0) will cause the arm to jitter at clamp-max-deg per step. This is
+intentional for wiring validation. Use clamp_tight_deg=1.0 for the
+first run and keep a hand near the power switch.
 """
 
 from __future__ import annotations
@@ -74,6 +97,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -442,21 +466,166 @@ class DeploySession:
             raise RuntimeError(f"dry-run loop failed rc={rc}")
         ok("dry-run complete — verify action lines made sense")
 
+    # ----- DreamerV3 motor-write loop (shared between tight + loose) ---- #
+
+    def _execute_dreamerv3_loop(
+        self,
+        duration_s: float,
+        max_step_deg: float,
+        step_label: str,
+    ) -> None:
+        """In-process DreamerV3 motor-write loop.
+
+        Reads joint positions from the real SO-101, runs the DreamerV3
+        actor, applies per-step safety clamping, and writes motor targets
+        via ``robot.send_action()``.
+
+        This method is shared by ``step_execute_tight`` (max_step_deg =
+        clamp_tight_deg) and ``step_execute_loose`` (max_step_deg =
+        clamp_loose_deg) to avoid code duplication.
+
+        Parameters
+        ----------
+        duration_s:
+            Total wall-clock duration of the motor-write loop.
+        max_step_deg:
+            Maximum per-step delta in degrees for arm joints (0..4).
+            Gripper delta is always capped at 5.0% regardless of this
+            value — gripper needs a separate slower scale.
+        step_label:
+            Short label for log messages, e.g. "tight" or "loose".
+        """
+        import numpy as np
+
+        from lerobot_isaac_deploy.arm_state_reader import (
+            _extract_joint_pos,
+            open_arm,
+        )
+        from lerobot_isaac_deploy.arm_motor_writer import (
+            compute_targets,
+            home_targets,
+            read_joint_limits,
+            write_targets,
+        )
+        from lerobot_isaac_deploy.wm_loader import load_dreamerv3
+
+        info(
+            f"STEP execute ({step_label}): {duration_s:.0f}s "
+            f"@ {max_step_deg}°/step arm clamp, 5%/step gripper clamp"
+        )
+
+        actor = load_dreamerv3(self.cfg.policy_path)
+
+        # Determine CNN key list + image size from actor config.
+        cnn_keys = list(getattr(actor, "cnn_keys", ["rgb"]) or ["rgb"])
+        image_size = 64
+        env_cfg = {}
+        if hasattr(actor, "cfg") and actor.cfg is not None:
+            env_cfg = (
+                actor.cfg.get("env")
+                if hasattr(actor.cfg, "get")
+                else {}
+            ) or {}
+        image_size = int(env_cfg.get("image_size") or 64)
+
+        robot = open_arm(self.cfg.port)
+        step = 0
+        try:
+            # Read joint limits from calibration; falls back to hardcoded floor.
+            jmin, jmax = read_joint_limits(robot)
+
+            # Object pose is unknown on real arm — zero position + identity quat.
+            # Matches training-time default (zero-camera + ones-quat default).
+            obj_pose_dummy = np.zeros(7, dtype=np.float32)
+            obj_pose_dummy[3] = 1.0  # w component of identity quaternion
+
+            rate_hz = float(getattr(self.cfg, "rate_hz", 30.0))
+            dt = 1.0 / rate_hz
+            t_end = time.monotonic() + duration_s
+
+            try:
+                while time.monotonic() < t_end:
+                    t0 = time.monotonic()
+
+                    # Read current joint positions.
+                    obs_dict = robot.get_observation()
+                    jp = _extract_joint_pos(obs_dict)
+
+                    # Build actor observation.
+                    state = np.concatenate([jp, obj_pose_dummy]).astype(np.float32)
+                    obs: dict = {"state": state}
+                    for k in cnn_keys:
+                        obs[k] = np.zeros(
+                            (3, image_size, image_size), dtype=np.uint8
+                        )
+
+                    # Run actor forward pass.
+                    action = actor.select_action(obs)
+                    action = np.asarray(action, dtype=np.float32).reshape(-1)
+
+                    # Compute clamped targets.
+                    targets = compute_targets(
+                        jp,
+                        action,
+                        max_step_deg=max_step_deg,
+                        max_step_gripper_pct=5.0,
+                        joint_limits_min=jmin,
+                        joint_limits_max=jmax,
+                    )
+
+                    # Write motor targets.
+                    write_targets(robot, targets)
+
+                    info(
+                        f"wm-exec [{step_label}] step {step} "
+                        f"jp={jp.round(2).tolist()} "
+                        f"action={action.round(2).tolist()} "
+                        f"targets={targets.round(2).tolist()}"
+                    )
+                    step += 1
+
+                    # Rate-limit: sleep remainder of dt.
+                    elapsed = time.monotonic() - t0
+                    if elapsed < dt:
+                        time.sleep(dt - elapsed)
+
+            except KeyboardInterrupt:
+                info("KeyboardInterrupt — homing arm before disconnect")
+
+        finally:
+            # home-on-exit always fires on normal / interrupt / exception exit.
+            if self.cfg.home_on_exit:
+                try:
+                    info("home-on-exit: sending zero targets")
+                    home_targets(robot)
+                    time.sleep(0.5)
+                except Exception as exc:  # noqa: BLE001
+                    warn(f"home-on-exit failed: {exc}")
+            try:
+                robot.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+
+        ok(f"execute ({step_label}) complete — {step} steps")
+
+    # ----- execute steps ------------------------------------------------ #
+
     def step_execute_tight(self) -> None:
-        # DreamerV3 motor-write is not yet implemented. The arm_motor_writer
-        # with safety clamps needs to be built before this path is safe to use.
-        # Convert the checkpoint to a LeRobot policy format, or wait for the
-        # arm_motor_writer implementation (tracked in docs/internals/deferred.md).
         if self._ckpt_kind == "dreamerv3":
-            raise NotImplementedError(
-                "dreamerv3 execute (motor write) is not yet supported. "
-                "Only --dry-run-loop works with dreamerv3 checkpoints. "
-                "Options:\n"
-                "  1. Convert the checkpoint to LeRobot policy format and "
-                "re-run with the converted checkpoint.\n"
-                "  2. Wait for arm_motor_writer implementation "
-                "(deferred — see docs/internals/)."
+            self._check_real_ckpt_gate()
+            self._confirm(
+                f"READY for TIGHT execute? Hand on e-stop. "
+                f"{self.cfg.clamp_tight_deg}°/step, {self.cfg.duration_tight_s:.0f}s. "
+                f"DreamerV3 actor — expect jitter at clamp max (wiring validation).",
+                safety_critical=True,
             )
+            self._execute_dreamerv3_loop(
+                duration_s=self.cfg.duration_tight_s,
+                max_step_deg=self.cfg.clamp_tight_deg,
+                step_label="tight",
+            )
+            return
+
         self._check_real_ckpt_gate()
         self._confirm(
             f"READY for tight execute? Hand on e-stop. "
@@ -483,17 +652,21 @@ class DeploySession:
         ok("tight execute complete — abort here if motion looked wrong")
 
     def step_execute_loose(self) -> None:
-        # DreamerV3 motor-write is not yet implemented. See step_execute_tight.
         if self._ckpt_kind == "dreamerv3":
-            raise NotImplementedError(
-                "dreamerv3 execute (motor write) is not yet supported. "
-                "Only --dry-run-loop works with dreamerv3 checkpoints. "
-                "Options:\n"
-                "  1. Convert the checkpoint to LeRobot policy format and "
-                "re-run with the converted checkpoint.\n"
-                "  2. Wait for arm_motor_writer implementation "
-                "(deferred — see docs/internals/)."
+            self._check_real_ckpt_gate()
+            self._confirm(
+                f"Step tight OK. Proceed to LOOSE execute? "
+                f"{self.cfg.clamp_loose_deg}°/step, {self.cfg.duration_loose_s:.0f}s. "
+                f"DreamerV3 actor — expect faster jitter at clamp max.",
+                safety_critical=True,
             )
+            self._execute_dreamerv3_loop(
+                duration_s=self.cfg.duration_loose_s,
+                max_step_deg=self.cfg.clamp_loose_deg,
+                step_label="loose",
+            )
+            return
+
         self._check_real_ckpt_gate()
         self._confirm(
             f"Step 3 OK. Proceed to {self.cfg.clamp_loose_deg}°/step, "
