@@ -443,30 +443,67 @@ def load_dreamerv3(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     # Robust load: weights_only=False needed for nested dict structure
     # (world_model/actor/critic/...), BUT un-pickling fails on numpy RNG
-    # state across numpy 1.x ↔ 2.x boundary with
-    # `<class 'numpy.random._pcg64.PCG64'> is not a known BitGenerator`.
-    # Workaround: temporarily patch numpy's BitGenerator ctor to fall
-    # back to a default PCG64 on lookup failure. We don't consume the
-    # saved RNG state for inference, so any valid bit generator is fine.
+    # state across numpy 1.x ↔ 2.x boundary. Two failure modes:
+    #   (1) ValueError: `<class numpy.random._pcg64.PCG64> is not a known
+    #       BitGenerator` — the ctor lookup itself fails
+    #   (2) TypeError: `state must be a dict` — ctor succeeds but
+    #       BitGenerator.__setstate__ rejects the saved state format
+    # We don't consume the saved RNG state for inference. Strategy: use a
+    # custom pickle unpickler that intercepts numpy.random.* class lookups
+    # and substitutes a stub that accepts/discards any args silently.
     try:
         ckpt_state = torch.load(cp, map_location=device, weights_only=False)
-    except (ValueError, ImportError) as exc:
+    except (ValueError, TypeError, ImportError) as exc:
         msg = str(exc)
-        if "BitGenerator" not in msg and "PCG64" not in msg:
+        if not any(s in msg for s in ("BitGenerator", "PCG64", "state must be a dict")):
             raise
-        import numpy as _np
-        import numpy.random._pickle as _np_pickle
-        _orig_ctor = _np_pickle.__bit_generator_ctor
-        def _tolerant_ctor(bit_generator_name="PCG64", *args, **kwargs):
-            try:
-                return _orig_ctor(bit_generator_name, *args, **kwargs)
-            except ValueError:
-                return _np.random.PCG64()
-        _np_pickle.__bit_generator_ctor = _tolerant_ctor
-        try:
-            ckpt_state = torch.load(cp, map_location=device, weights_only=False)
-        finally:
-            _np_pickle.__bit_generator_ctor = _orig_ctor
+        import pickle as _pickle
+        import types as _types
+
+        class _NumpyRNGStub:
+            """No-op stand-in for numpy.random.BitGenerator subclasses.
+            Accepts any constructor / setstate args silently."""
+            def __init__(self, *a, **k): pass
+            def __setstate__(self, state): pass
+            def __reduce__(self):
+                return (_NumpyRNGStub, ())
+
+        class _TolerantUnpickler(_pickle.Unpickler):
+            def find_class(self, module, name):
+                # Intercept ALL numpy.random.* lookups — BitGenerator types,
+                # Generator types, and the ctor helpers in _pickle module.
+                # Any of these may be invoked during un-pickle of a saved
+                # RNG state; we don't need real RNG continuity for inference.
+                if module.startswith("numpy.random"):
+                    # Class lookups (BitGenerator subclasses, Generator, etc.)
+                    if any(s in name for s in (
+                        "BitGenerator", "Generator", "PCG64",
+                        "MT19937", "Philox", "SFC64", "RandomState",
+                    )):
+                        return _NumpyRNGStub
+                    # Ctor helpers — make them no-ops that return the stub.
+                    if name in ("__bit_generator_ctor", "__generator_ctor",
+                                "__randomstate_ctor"):
+                        return lambda *a, **k: _NumpyRNGStub()
+                return super().find_class(module, name)
+
+        # Build a module-like façade torch.load expects via pickle_module=.
+        # __name__ is mandatory (torch._check_dill_version reads it).
+        _tolerant_pickle = _types.SimpleNamespace(
+            __name__="lerobot_isaac_deploy._tolerant_pickle",
+            Unpickler=_TolerantUnpickler,
+            UnpicklingError=_pickle.UnpicklingError,
+            load=_pickle.load,
+            loads=_pickle.loads,
+            Pickler=_pickle.Pickler,
+            HIGHEST_PROTOCOL=_pickle.HIGHEST_PROTOCOL,
+        )
+        ckpt_state = torch.load(
+            cp,
+            map_location=device,
+            weights_only=False,
+            pickle_module=_tolerant_pickle,
+        )
 
     # sheeprl 0.5+ DreamerV3 build_agent signature:
     #   build_agent(fabric, actions_dim, is_continuous, cfg, obs_space,
