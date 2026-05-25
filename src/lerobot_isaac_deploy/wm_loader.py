@@ -441,7 +441,32 @@ def load_dreamerv3(
             cfg = {}
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_state = torch.load(cp, map_location=device, weights_only=False)
+    # Robust load: weights_only=False needed for nested dict structure
+    # (world_model/actor/critic/...), BUT un-pickling fails on numpy RNG
+    # state across numpy 1.x ↔ 2.x boundary with
+    # `<class 'numpy.random._pcg64.PCG64'> is not a known BitGenerator`.
+    # Workaround: temporarily patch numpy's BitGenerator ctor to fall
+    # back to a default PCG64 on lookup failure. We don't consume the
+    # saved RNG state for inference, so any valid bit generator is fine.
+    try:
+        ckpt_state = torch.load(cp, map_location=device, weights_only=False)
+    except (ValueError, ImportError) as exc:
+        msg = str(exc)
+        if "BitGenerator" not in msg and "PCG64" not in msg:
+            raise
+        import numpy as _np
+        import numpy.random._pickle as _np_pickle
+        _orig_ctor = _np_pickle.__bit_generator_ctor
+        def _tolerant_ctor(bit_generator_name="PCG64", *args, **kwargs):
+            try:
+                return _orig_ctor(bit_generator_name, *args, **kwargs)
+            except ValueError:
+                return _np.random.PCG64()
+        _np_pickle.__bit_generator_ctor = _tolerant_ctor
+        try:
+            ckpt_state = torch.load(cp, map_location=device, weights_only=False)
+        finally:
+            _np_pickle.__bit_generator_ctor = _orig_ctor
 
     # sheeprl 0.5+ DreamerV3 build_agent signature:
     #   build_agent(fabric, actions_dim, is_continuous, cfg, obs_space,
