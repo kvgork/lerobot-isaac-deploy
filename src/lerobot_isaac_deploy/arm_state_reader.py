@@ -122,13 +122,17 @@ def _extract_joint_pos(obs: dict) -> np.ndarray:
     Handles two observation dict shapes produced by different lerobot
     versions / robot configurations:
 
-    Shape A — flat state array (lerobot 0.5.x default)::
+    Shape A — flat state array (older lerobot)::
 
         {"observation.state": np.ndarray (6,)}
 
-    Shape B — per-joint keys::
+    Shape B — observation.state.<joint> keys::
 
         {"observation.state.shoulder_pan": float, ...}
+
+    Shape C — <joint>.pos keys (lerobot 0.5+ SO101Follower.get_observation())::
+
+        {"shoulder_pan.pos": float, "shoulder_lift.pos": float, ...}
 
     Falls back to zeros for missing keys so the caller always receives a
     valid array (the WM actor will emit garbage actions, but no crash).
@@ -143,7 +147,7 @@ def _extract_joint_pos(obs: dict) -> np.ndarray:
     np.ndarray
         Shape ``(6,)`` float32.
     """
-    # Shape A: flat state vector (most common with lerobot 0.5)
+    # Shape A: flat state vector
     if "observation.state" in obs:
         arr = np.asarray(obs["observation.state"], dtype=np.float32).reshape(-1)
         # Guard against unexpected dimensions — take first 6 or pad.
@@ -153,7 +157,14 @@ def _extract_joint_pos(obs: dict) -> np.ndarray:
         padded[: arr.shape[0]] = arr
         return padded
 
-    # Shape B: per-joint keys
+    # Shape C: lerobot 0.5+ format — <joint>.pos keys
+    if any(f"{k}.pos" in obs for k in SO101_JOINT_NAMES):
+        return np.array(
+            [float(obs.get(f"{k}.pos", 0.0)) for k in SO101_JOINT_NAMES],
+            dtype=np.float32,
+        )
+
+    # Shape B: per-joint keys with observation.state prefix
     return np.array(
         [
             float(obs.get(f"observation.state.{k}", 0.0))

@@ -256,3 +256,18 @@ def test_so101_joint_names_canonical_order() -> None:
         "gripper",
     ]
     assert SO101_JOINT_NAMES == expected
+
+
+def test_extract_joint_pos_shape_c_joint_pos_keys():
+    """lerobot 0.5+ SO101Follower.get_observation() returns
+    {'<joint>.pos': float, ...} — the wm dry-run must read these."""
+    from lerobot_isaac_deploy.arm_state_reader import _extract_joint_pos, SO101_JOINT_NAMES
+
+    # Realistic observation as returned by SO101Follower.get_observation().
+    obs = {f"{name}.pos": float(i) for i, name in enumerate(SO101_JOINT_NAMES)}
+    # Plus a camera key that should be ignored.
+    obs["wrist.image"] = "dummy-image-tensor"
+    arr = _extract_joint_pos(obs)
+    assert arr.shape == (6,)
+    assert arr.dtype.name == "float32"
+    assert arr.tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
