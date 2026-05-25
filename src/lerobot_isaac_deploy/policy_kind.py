@@ -76,11 +76,17 @@ def detect_policy_kind(path: Path | str) -> PolicyKind:
         ):
             return "lerobot"
 
-        # DreamerV3 sheeprl — has .hydra/config.yaml + a ckpt_*.ckpt file
-        if (c / ".hydra" / "config.yaml").is_file():
+        # DreamerV3 sheeprl — two known layouts:
+        #   (1) Hydra:     <c>/.hydra/config.yaml + <c>/ckpt_*.ckpt
+        #   (2) Lightning: <c>/config.yaml         + <c>/checkpoint/ckpt_*.ckpt
+        # The Lightning layout is what sheeprl emits in newer versions
+        # (CSVLogger on version_0/ dirs).
+        _has_hydra_cfg = (c / ".hydra" / "config.yaml").is_file()
+        _has_lightning_cfg = (c / "config.yaml").is_file() and (c / "checkpoint").is_dir()
+        if _has_hydra_cfg or _has_lightning_cfg:
             if any(c.glob("ckpt_*.ckpt")) or any(c.glob("**/ckpt_*.ckpt")):
                 return "dreamerv3"
-            # No ckpt file yet — still claim dreamerv3 by the hydra signature.
+            # No ckpt file yet — still claim dreamerv3 by the cfg signature.
             return "dreamerv3"
 
         # LeWM — explicit marker file
