@@ -6,6 +6,7 @@ Steps:
     1. preflight                robot-data-run-check   (no robot)
     2. dry-run loop             robot-data-run          (robot, no motors)
        (or in-process mock loop when ``--mock-hardware`` is set)
+       (or in-process real-arm read + dreamerv3 actor for dreamerv3 ckpts)
     3. execute @ 1°/step        robot-data-run --execute
     4. execute @ 3°/step        robot-data-run --execute
     5. closed-loop N-ep eval    robot-data-run-eval
@@ -40,6 +41,30 @@ Pass ``--require-real-ckpt`` (or set
 ``LI_DEPLOY_REQUIRE_REAL_CKPT=1``) to refuse motor-write steps when the
 checkpoint directory contains a ``synthetic_marker.json`` test fixture.
 This prevents accidental real-arm execution with a mock checkpoint.
+
+DreamerV3 dry-run (Path B)
+--------------------------
+When ``_ckpt_kind == "dreamerv3"`` and ``--mock-hardware`` is NOT set,
+``step_dry_loop`` uses an in-process loop that:
+
+    1. Loads the DreamerV3 actor via
+       :func:`lerobot_isaac_deploy.wm_loader.load_dreamerv3`.
+    2. Opens the real SO-101 at ``cfg.port`` via
+       :func:`lerobot_isaac_deploy.arm_state_reader.open_arm` (read-only,
+       no motor writes).
+    3. Streams joint positions at ``cfg.rate_hz`` for
+       ``cfg.duration_dry_s`` seconds via
+       :func:`lerobot_isaac_deploy.arm_state_reader.stream_joint_pos`.
+    4. Constructs a state vector ``[joint_pos(6) | obj_pose_dummy(7)]``
+       and a zeroed RGB image (the WM actor does not require real vision
+       in this path).
+    5. Calls ``actor.select_action(obs)`` and logs the action vector.
+       NEVER writes to motors.
+
+The execute steps (step 3 and 4) are NOT yet implemented for DreamerV3
+checkpoints. A ``NotImplementedError`` with an actionable message is
+raised if attempted. Convert the checkpoint to a LeRobot policy format
+or wait for the ``arm_motor_writer`` implementation.
 """
 
 from __future__ import annotations
@@ -350,6 +375,65 @@ class DeploySession:
             f"SO-101 plugged in at {self.cfg.port}? Workspace clear?"
         )
         info(f"STEP 2: dry-run loop ({self.cfg.duration_dry_s:.0f}s, NO motor writes)")
+
+        if self._ckpt_kind == "dreamerv3":
+            # Path B: in-process real-arm read + DreamerV3 actor + log-only output.
+            # Real joint positions are read from the SO-101 at cfg.port.
+            # NEVER writes motors — this is the dry-run path regardless of --execute.
+            import numpy as np
+
+            from lerobot_isaac_deploy.arm_state_reader import open_arm, stream_joint_pos
+            from lerobot_isaac_deploy.wm_loader import load_dreamerv3
+
+            actor = load_dreamerv3(self.cfg.policy_path)
+            robot = open_arm(self.cfg.port)
+            try:
+                # Dummy object pose: position zeros + identity quaternion.
+                # Real vision is deferred — the WM actor tolerates zeroed image obs.
+                obj_pose_dummy = np.zeros(7, dtype=np.float32)
+                obj_pose_dummy[3] = 1.0  # w component of identity quaternion
+
+                cnn_keys = list(getattr(actor, "cnn_keys", ["rgb"]) or ["rgb"])
+                image_size = 64
+                env_cfg = {}
+                if hasattr(actor, "cfg") and actor.cfg is not None:
+                    env_cfg = (
+                        actor.cfg.get("env")
+                        if hasattr(actor.cfg, "get")
+                        else {}
+                    ) or {}
+                image_size = int(env_cfg.get("image_size") or 64)
+
+                step = 0
+                for jp in stream_joint_pos(
+                    robot,
+                    rate_hz=self.cfg.rate_hz,
+                    duration_s=self.cfg.duration_dry_s,
+                ):
+                    state = np.concatenate([jp, obj_pose_dummy]).astype(np.float32)
+                    obs: dict = {"state": state}
+                    for k in cnn_keys:
+                        obs[k] = np.zeros((3, image_size, image_size), dtype=np.uint8)
+                    action = actor.select_action(obs)
+                    action = np.asarray(action, dtype=np.float32).reshape(-1)
+                    info(
+                        f"real-wm step {step} "
+                        f"jp={jp.round(3).tolist()} "
+                        f"action={action.round(3).tolist()}"
+                    )
+                    step += 1
+
+                ok(
+                    f"real-hw dry-run loop complete — {step} steps, NO motor writes"
+                )
+            finally:
+                try:
+                    robot.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        # Existing lerobot path — subprocess to robot-data-run.
         run = self._find_runner_bin("robot-data-run")
         cmd = self._base_runner_cmd(run, duration_s=self.cfg.duration_dry_s)
         cmd += ["-v"]
@@ -359,6 +443,20 @@ class DeploySession:
         ok("dry-run complete — verify action lines made sense")
 
     def step_execute_tight(self) -> None:
+        # DreamerV3 motor-write is not yet implemented. The arm_motor_writer
+        # with safety clamps needs to be built before this path is safe to use.
+        # Convert the checkpoint to a LeRobot policy format, or wait for the
+        # arm_motor_writer implementation (tracked in docs/internals/deferred.md).
+        if self._ckpt_kind == "dreamerv3":
+            raise NotImplementedError(
+                "dreamerv3 execute (motor write) is not yet supported. "
+                "Only --dry-run-loop works with dreamerv3 checkpoints. "
+                "Options:\n"
+                "  1. Convert the checkpoint to LeRobot policy format and "
+                "re-run with the converted checkpoint.\n"
+                "  2. Wait for arm_motor_writer implementation "
+                "(deferred — see docs/internals/)."
+            )
         self._check_real_ckpt_gate()
         self._confirm(
             f"READY for tight execute? Hand on e-stop. "
@@ -385,6 +483,17 @@ class DeploySession:
         ok("tight execute complete — abort here if motion looked wrong")
 
     def step_execute_loose(self) -> None:
+        # DreamerV3 motor-write is not yet implemented. See step_execute_tight.
+        if self._ckpt_kind == "dreamerv3":
+            raise NotImplementedError(
+                "dreamerv3 execute (motor write) is not yet supported. "
+                "Only --dry-run-loop works with dreamerv3 checkpoints. "
+                "Options:\n"
+                "  1. Convert the checkpoint to LeRobot policy format and "
+                "re-run with the converted checkpoint.\n"
+                "  2. Wait for arm_motor_writer implementation "
+                "(deferred — see docs/internals/)."
+            )
         self._check_real_ckpt_gate()
         self._confirm(
             f"Step 3 OK. Proceed to {self.cfg.clamp_loose_deg}°/step, "
