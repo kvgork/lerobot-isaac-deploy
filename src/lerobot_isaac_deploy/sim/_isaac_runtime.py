@@ -51,7 +51,9 @@ class IsaacSimRuntime:
     """
 
     usd_path: Path
-    render_cameras: tuple[str, ...] = ("overhead_camera_rgb", "wrist_camera_rgb")
+    # Default matches DR100 sim env + real LeRobot dataset (single D435 wrist cam).
+    # Callers training against a multi-cam scene can override per-deploy.
+    render_cameras: tuple[str, ...] = ("d435_rgb",)
     rate_hz: float = 30.0
     headless: bool = True
     enable_cameras: bool = True
@@ -346,8 +348,9 @@ class IsaacSimRuntime:
         imgs: dict[str, Any] = {}
         for name, cam in self._cameras.items():
             rgb = cam.data.output["rgb"][0]  # (H, W, 3) uint8 tensor
-            # permute HWC → CHW, cast to float32, normalize [0,255] → [-0.5, 0.5]
-            rgb_t = rgb.permute(2, 0, 1).float().div_(255.0).sub_(0.5)
+            # permute HWC → CHW, .contiguous() to materialize C-order, then
+            # cast to float32, normalize [0,255] → [-0.5, 0.5].
+            rgb_t = rgb.permute(2, 0, 1).contiguous().float().div_(255.0).sub_(0.5)
             imgs[f"observation.images.{name}"] = rgb_t.cpu().numpy()
 
         # 3. Object pose (xyz + xyzw quaternion) from USD prim via pxr.
@@ -363,7 +366,11 @@ class IsaacSimRuntime:
                 )
                 t = xform.ExtractTranslation()
                 q = Gf.Rotation(xform.ExtractRotationMatrix()).GetQuat()
-                # Gf.Quatd stores (real, imaginary); LeRobot schema wants xyzw.
+                # TODO(verify-on-isaac-sim-6.0): Gf.Quatd stores (real, imaginary).
+                # GetImaginary() returns Gf.Vec3d of xyz components; GetReal() is w.
+                # Final layout written here is xyzw to match LeRobot schema. Confirm
+                # imaginary-component ordering on first live deploy — if mirrored,
+                # swap indices [3,4,5]. See review note on commit 6b7484c.
                 im = q.GetImaginary()
                 obj_pose[:3] = [float(t[0]), float(t[1]), float(t[2])]
                 obj_pose[3:6] = [float(im[0]), float(im[1]), float(im[2])]  # xyz imag
