@@ -6,11 +6,29 @@ shortcuts that mirror the bash scripts they replace.
 
 from __future__ import annotations
 
-import argparse
+import logging
+import os
 import sys
 
 
+def _quiet_hf_hub() -> None:
+    """Force HF offline + drop request logs BEFORE any lerobot/hf_hub import.
+
+    The SmolVLM2 backbone is already cached for deploy, but huggingface_hub
+    HEAD/GETs the hub on every policy load (log flood + latency). Setting these
+    env vars here — before DeploySession imports lerobot, and before the
+    robot-data-run subprocess inherits os.environ — stops the requests. The
+    subprocess reads HF_HUB_OFFLINE at its own startup. Override: HF_HUB_OFFLINE=0.
+    """
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    for name in ("httpx", "huggingface_hub", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def session_main(argv: list[str] | None = None) -> int:
+    _quiet_hf_hub()
     from lerobot_isaac_deploy.session import (
         DeploySession,
         build_session_parser,
