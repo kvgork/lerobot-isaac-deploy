@@ -121,7 +121,11 @@ class SessionConfig:
     policy_path: Path
     dataset_root: Path
     port: str = "/dev/ttyACM0"
-    camera: str = "d435_rgb=/dev/video0,640,480"
+    camera: str = "d435_rgb=/dev/video2,640,480"
+    # Fixed SO-101 follower calibration id. Forwarded to robot-data-run(-eval)
+    # as --id so calibration is saved/reused at so_follower/<robot_id>.json
+    # instead of an anonymous None.json that re-calibrates each run.
+    robot_id: str = "so101_follower"
     task: str = "pick and place cube"
     rate_hz: float = 30.0
     duration_dry_s: float = 30.0
@@ -134,6 +138,10 @@ class SessionConfig:
     home_on_exit: bool = True
     do_dry_loop: bool = False
     do_execute: bool = False
+    # Skip the motors-OFF dry-run loop before --execute. The dry loop is a
+    # safety gate (verify sane actions on the live arm with no motor writes);
+    # only skip it once you've already verified a clean dry-run this session.
+    skip_dry_loop: bool = False
     skip_closed_loop: bool = False
     assume_yes: bool = False
     mock_hardware: bool = False
@@ -774,6 +782,8 @@ class DeploySession:
             "--output-json", str(out),
             "--i-have-read-the-safety-runbook",
         ]
+        if self.cfg.robot_id:
+            cmd += ["--id", self.cfg.robot_id]
         if self.cfg.home_on_exit:
             cmd.append("--home-on-exit")
         rc = subprocess.run(cmd, check=False).returncode
@@ -801,6 +811,8 @@ class DeploySession:
             "--duration-s", str(duration_s),
             "--task", self.cfg.task,
         ]
+        if self.cfg.robot_id:
+            cmd += ["--id", self.cfg.robot_id]
         if max_relative_target is not None:
             cmd += ["--max-relative-target", str(max_relative_target)]
         return cmd
@@ -840,10 +852,13 @@ class DeploySession:
             if not (self.cfg.do_dry_loop or self.cfg.do_execute):
                 ok("preflight only — done. Pass --dry-run-loop or --execute.")
                 return 0
-            self.step_dry_loop()
-            if not self.cfg.do_execute:
-                ok("dry-run only — done. Pass --execute to send motor commands.")
-                return 0
+            if self.cfg.skip_dry_loop and self.cfg.do_execute:
+                warn("skipping motors-OFF dry loop (--skip-dry-loop) → straight to execute")
+            else:
+                self.step_dry_loop()
+                if not self.cfg.do_execute:
+                    ok("dry-run only — done. Pass --execute to send motor commands.")
+                    return 0
             self.step_execute_tight()
             self.step_execute_loose()
             if self.cfg.skip_closed_loop:
@@ -951,7 +966,10 @@ def build_session_parser() -> argparse.ArgumentParser:
                          "LEROBOT_ISAAC_DEPLOY_DATASET_ROOT env > "
                          "<deploy>/datasets/so101-pickplace1."))
     p.add_argument("--port", default="/dev/ttyACM0")
-    p.add_argument("--camera", default="d435_rgb=/dev/video0,640,480")
+    p.add_argument("--camera", default="d435_rgb=/dev/video2,640,480")
+    p.add_argument("--robot-id", dest="robot_id", default="so101_follower",
+                   help="Fixed SO-101 follower calibration id (so_follower/<id>.json). "
+                        "Persists calibration across runs.")
     p.add_argument("--task", default="pick and place cube")
     p.add_argument("--rate-hz", type=float, default=30.0)
     p.add_argument("--duration-s", dest="duration_dry_s", type=float,
@@ -1007,6 +1025,7 @@ def cfg_from_namespace(ns: argparse.Namespace) -> SessionConfig:
         dataset_root=dataset_root,
         port=ns.port,
         camera=ns.camera,
+        robot_id=ns.robot_id,
         task=ns.task,
         rate_hz=ns.rate_hz,
         duration_dry_s=ns.duration_dry_s,
