@@ -33,6 +33,24 @@ logger = logging.getLogger(__name__)
 WARM_UP_FRAMES = 30
 
 
+# Map a dataset/obs camera key -> the camera prim NAME baked into the
+# isaac-auto-scene USD (under the scene root). The generator emits a single
+# wrist camera as `def Camera "D435"`. Add entries here if future scenes bake
+# additional named cameras.
+_SCENE_CAMERA_PRIMS: dict[str, str] = {
+    "d435_rgb": "D435",
+    "d435": "D435",
+}
+
+
+def _scene_camera_prim(obs_camera_name: str) -> str:
+    """Resolve an obs camera key to its USD prim name in the auto-scene USD.
+
+    Falls back to the name itself (so an exact-match prim still works).
+    """
+    return _SCENE_CAMERA_PRIMS.get(obs_camera_name, obs_camera_name)
+
+
 @dataclass
 class IsaacSimRuntime:
     """Boot + manage one Isaac Sim instance for closed-loop sim deploy.
@@ -165,8 +183,9 @@ class IsaacSimRuntime:
         if not self.usd_path.is_file():
             raise FileNotFoundError(
                 f"USD scene not found: {self.usd_path}. "
-                f"Run isaac-auto-scene to generate it, then place at "
-                f"`assets/sim_scenes/<name>.usd`."
+                f"Generate it with `isaac-auto-scene generate` into the configs "
+                f"leaf (lerobot_isaac_configs/scenes/<name>.usd), then resolve "
+                f"via `lerobot_isaac_configs.get_scene_path('<name>')`."
             )
         # phase2.1 — soft-import: this function is only called after AppLauncher
         # has initialised the Isaac Sim stage.
@@ -204,10 +223,11 @@ class IsaacSimRuntime:
 
         cfg = cfg.replace(prim_path="/World/Scene/SO101")
         self._articulation = Articulation(cfg)
-        logger.debug(
-            "SO-101 Articulation attached at /World/Scene/SO101, num_joints=%s",
-            self._articulation.num_joints,
-        )
+        # NOTE: do NOT access num_joints / any articulation *data* here — the
+        # underlying PhysX view is only created by `self._sim.reset()` (called
+        # later in _boot). Touching `num_joints` now raises
+        # `'Articulation' object has no attribute '_root_physx_view'`.
+        logger.debug("SO-101 Articulation attached at /World/Scene/SO101 (pre-reset)")
 
     def _attach_cameras(self) -> None:
         """Register CameraCfg for every name in self.render_cameras.
@@ -226,10 +246,43 @@ class IsaacSimRuntime:
                 f"isaaclab.sensors.CameraCfg not importable ({exc})"
             ) from exc
 
+        # The isaac-auto-scene USD bakes each camera pose as a single
+        # `matrix4d xformOp:transform`, but isaaclab's Camera sensor requires a
+        # standard [translate, orient, scale] xform-op stack. Standardise the
+        # camera prim(s) in place first (preserves the world pose), else
+        # CameraCfg raises "not a xformable prim with standard transform ops".
+        import omni.usd  # type: ignore
+        from isaaclab.sim.utils import (  # type: ignore
+            standardize_xform_ops,
+            validate_standard_xform_ops,
+        )
+
+        stage = omni.usd.get_context().get_stage()
+
         # phase2.3 — register one Camera sensor per requested camera name.
+        # The isaac-auto-scene USD bakes the camera as `def Camera "D435"` under
+        # the scene root, so under /World/Scene it lives at /World/Scene/D435
+        # (NOT /World/Scene/cameras/<name>). We attach to the existing prim with
+        # spawn=None — CameraCfg requires spawn to be set explicitly (even None),
+        # otherwise it raises "Missing values detected ... spawn".
         for name in self.render_cameras:
+            cam_prim_path = f"/World/Scene/{_scene_camera_prim(name)}"
+            prim = stage.GetPrimAtPath(cam_prim_path)
+            # Canonical [translate, orient, scale] is required by isaaclab. Scenes
+            # from current isaac-auto-scene already emit it; only standardise a
+            # legacy matrix4d prim (runtime AddXformOp(scale) can fail on Camera
+            # prims, so guard it and let CameraCfg surface any real problem).
+            if prim and prim.IsValid() and not validate_standard_xform_ops(prim):
+                try:
+                    standardize_xform_ops(prim)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "standardize_xform_ops failed for %s (%s); regenerate the "
+                        "scene with current isaac-auto-scene.", cam_prim_path, exc
+                    )
             cam_cfg = CameraCfg(
-                prim_path=f"/World/Scene/cameras/{name}",
+                prim_path=cam_prim_path,
+                spawn=None,  # attach to the existing USD camera prim
                 width=64,
                 height=64,
                 data_types=["rgb"],
@@ -237,7 +290,11 @@ class IsaacSimRuntime:
             )
             cam = Camera(cam_cfg)
             self._cameras[name] = cam
-            logger.debug("Camera registered: /World/Scene/cameras/%s (64×64 RGB)", name)
+            logger.debug(
+                "Camera registered: /World/Scene/%s -> obs '%s' (64x64 RGB)",
+                _scene_camera_prim(name),
+                name,
+            )
 
     def _post_reset_camera_init(self) -> None:
         """After sim.reset(), do anything that requires _ALL_INDICES set.

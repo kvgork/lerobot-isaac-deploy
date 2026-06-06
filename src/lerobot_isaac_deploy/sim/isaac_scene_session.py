@@ -22,7 +22,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-import numpy as np
+
+def _default_scene_path(name: str = "so101_workspace") -> Path:
+    """Resolve the bundled scene USD from lerobot-isaac-configs.
+
+    Soft-imported so this module stays importable on a laptop that has the
+    deploy package but not the configs leaf installed. Raises a clear error
+    pointing at the explicit ``usd_path`` arg if configs is unavailable.
+    """
+    try:
+        from lerobot_isaac_configs import get_scene_path
+    except ImportError as exc:  # pragma: no cover - exercised only sans configs
+        raise ImportError(
+            "usd_path was None and lerobot-isaac-configs is not installed, so "
+            "the default scene cannot be resolved. Either `pip install "
+            "lerobot-isaac-configs` or pass an explicit usd_path."
+        ) from exc
+    return get_scene_path(name)
 
 
 @dataclass
@@ -112,19 +128,27 @@ class IsaacSceneSession:
         Optional DR config file (see Phase 4 of the plan).
     """
 
-    usd_path: Path
+    # Pass ``None`` to resolve the bundled scene from lerobot-isaac-configs
+    # (``get_scene_path("so101_workspace")``) — keeps callers off the
+    # gitignored workspace ``assets/`` path. Field stays positionally required
+    # (no default) so the two required fields below need no defaults.
+    usd_path: Path | None
     policy_path: Path
     dataset_root: Path
     n_episodes: int = 10
     max_steps: int = 600
     rate_hz: float = 30.0
-    render_cameras: tuple[str, ...] = ("overhead_camera_rgb", "wrist_camera_rgb")
+    # DR100 Phase 1: single D435 wrist cam (was overhead+wrist). Matches the
+    # env ``d435_rgb`` obs term and the real SO-101 dataset column.
+    render_cameras: tuple[str, ...] = ("d435_rgb",)
     device: str = "cuda"
     success_criterion: str | Callable[[dict, dict], bool] = "pickplace_basket"
     output_dir: Path | None = None
     dr_config: Path | None = None
 
     def __post_init__(self) -> None:
+        if self.usd_path is None:
+            self.usd_path = _default_scene_path()
         self.usd_path = Path(self.usd_path)
         self.policy_path = Path(self.policy_path)
         self.dataset_root = Path(self.dataset_root)
