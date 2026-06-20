@@ -12,6 +12,9 @@ Lerobot import path (verified from robot-data-runner/runner.py):
 This module is intentionally tiny — it contains only the arm-state read
 path. Camera reads, motor writes, and safety monitoring all live in
 robot-data-runner.
+
+For outcome verification after a real rollout (did the object land in the
+bin?), see :mod:`lerobot_isaac_deploy.outcome_reader`.
 """
 
 from __future__ import annotations
