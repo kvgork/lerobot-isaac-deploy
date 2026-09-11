@@ -52,10 +52,13 @@ Ramped home:
 
 from __future__ import annotations
 
+import logging
 import time as _time
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Canonical SO-101 joint order — matches arm_state_reader.SO101_JOINT_NAMES
 # and the training-time joint ordering.
@@ -189,8 +192,7 @@ def write_targets(
     """
     t = np.asarray(targets_deg, dtype=np.float32).reshape(6)
     action_dict = {
-        f"{name}.pos": float(t[i])
-        for i, name in enumerate(SO101_JOINT_NAMES)
+        f"{name}.pos": float(t[i]) for i, name in enumerate(SO101_JOINT_NAMES)
     }
     robot.send_action(action_dict)
 
@@ -358,4 +360,32 @@ def read_joint_limits(robot: Any) -> tuple[np.ndarray, np.ndarray]:
     # returns symmetric ranges.
     min_arr = np.maximum(min_arr, _DEFAULT_JOINT_LIMITS_MIN)
     max_arr = np.minimum(max_arr, _DEFAULT_JOINT_LIMITS_MAX)
+
+    # EMPTY intersection guard (2026-09-11). When a joint's calibrated span lies
+    # entirely outside the floor the intersection is empty, and the lines above
+    # express that as min > max. `np.clip(x, lo, hi)` with lo > hi returns `hi`,
+    # so for a span entirely BELOW the floor this silently pins the joint to a
+    # target outside the floor:
+    #     cal (-200, -150) vs floor (-90, 90) -> min=-90, max=-150
+    #     np.clip(-120, -90, -150) == -150      <- outside the -90 floor
+    # (A span entirely ABOVE the floor happens to pin to the floor max and is
+    # safe, which is exactly why this went unnoticed.)
+    #
+    # There is no safe non-empty answer, so keep the floor for that joint and say
+    # so loudly — a calibration this far out means the calibration is wrong, the
+    # joint is misidentified, or the floor is stale. All need a human.
+    inverted = min_arr > max_arr
+    if bool(np.any(inverted)):
+        for i in np.flatnonzero(inverted):
+            logger.error(
+                "joint %r: calibrated range does not intersect the safety floor "
+                "[%.1f, %.1f] deg — ignoring the calibration for this joint and "
+                "using the floor. Re-run calibration before driving the arm.",
+                SO101_JOINT_NAMES[i],
+                float(_DEFAULT_JOINT_LIMITS_MIN[i]),
+                float(_DEFAULT_JOINT_LIMITS_MAX[i]),
+            )
+        min_arr = np.where(inverted, _DEFAULT_JOINT_LIMITS_MIN, min_arr)
+        max_arr = np.where(inverted, _DEFAULT_JOINT_LIMITS_MAX, max_arr)
+
     return min_arr, max_arr

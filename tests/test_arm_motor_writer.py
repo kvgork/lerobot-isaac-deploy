@@ -11,7 +11,7 @@ All tests use mocks — no hardware required. Covers:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -71,9 +71,7 @@ class TestComputeTargets:
         # jp[2]=20.0 is within [-10, 90]; jp[4]=30.0 within [-90, 90], etc.
         np.testing.assert_allclose(result, jp, atol=1e-5)
 
-    def test_full_positive_action_adds_max_step_deg(
-        self, zero_jp: np.ndarray
-    ) -> None:
+    def test_full_positive_action_adds_max_step_deg(self, zero_jp: np.ndarray) -> None:
         """action=+1.0 on arm joints adds exactly max_step_deg."""
         action = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32)
         max_step = 2.5
@@ -107,9 +105,7 @@ class TestComputeTargets:
         jp = zero_jp.copy()
         jp[5] = 30.0
         action = np.array([0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float32)
-        result = compute_targets(
-            jp, action, max_step_deg=5.0, max_step_gripper_pct=5.0
-        )
+        result = compute_targets(jp, action, max_step_deg=5.0, max_step_gripper_pct=5.0)
         assert result[5] == pytest.approx(25.0, abs=1e-4)
 
     def test_arm_and_gripper_simultaneously(self, zero_jp: np.ndarray) -> None:
@@ -121,11 +117,11 @@ class TestComputeTargets:
         result = compute_targets(
             jp, action, max_step_deg=max_step, max_step_gripper_pct=max_grip
         )
-        assert result[0] == pytest.approx(2.0, abs=1e-4)   # +1 * 2
+        assert result[0] == pytest.approx(2.0, abs=1e-4)  # +1 * 2
         assert result[1] == pytest.approx(-2.0, abs=1e-4)  # -1 * 2
-        assert result[2] == pytest.approx(1.0, abs=1e-4)   # +0.5 * 2
+        assert result[2] == pytest.approx(1.0, abs=1e-4)  # +0.5 * 2
         assert result[3] == pytest.approx(-1.0, abs=1e-4)  # -0.5 * 2
-        assert result[4] == pytest.approx(0.0, abs=1e-4)   # 0 * 2
+        assert result[4] == pytest.approx(0.0, abs=1e-4)  # 0 * 2
         assert result[5] == pytest.approx(58.0, abs=1e-4)  # 50 + 0.8*10
 
 
@@ -177,7 +173,9 @@ class TestComputeTargetsClamping:
         custom_min = np.array([-5.0, -90.0, -10.0, -90.0, -90.0, 0.0], dtype=np.float32)
         custom_max = np.array([5.0, 90.0, 90.0, 90.0, 90.0, 100.0], dtype=np.float32)
         result = compute_targets(
-            jp, action, max_step_deg=10.0,
+            jp,
+            action,
+            max_step_deg=10.0,
             joint_limits_min=custom_min,
             joint_limits_max=custom_max,
         )
@@ -188,12 +186,16 @@ class TestComputeTargetsClamping:
         """Default elbow_flex min is -10° (table-avoidance constraint)."""
         assert _DEFAULT_JOINT_LIMITS_MIN[2] == pytest.approx(-10.0, abs=1e-4)
 
-    def test_output_dtype_is_float32(self, zero_jp: np.ndarray, zero_action: np.ndarray) -> None:
+    def test_output_dtype_is_float32(
+        self, zero_jp: np.ndarray, zero_action: np.ndarray
+    ) -> None:
         """compute_targets always returns float32."""
         result = compute_targets(zero_jp, zero_action, max_step_deg=1.0)
         assert result.dtype == np.float32
 
-    def test_output_shape_is_6(self, zero_jp: np.ndarray, zero_action: np.ndarray) -> None:
+    def test_output_shape_is_6(
+        self, zero_jp: np.ndarray, zero_action: np.ndarray
+    ) -> None:
         """compute_targets returns shape (6,)."""
         result = compute_targets(zero_jp, zero_action, max_step_deg=1.0)
         assert result.shape == (6,)
@@ -311,7 +313,8 @@ class TestReadJointLimits:
         # 4096 ticks → 360°; center at 0° = 2048 ticks.
         robot.calibration = {
             "shoulder_pan": self._make_mock_cal_entry(
-                range_min=1024, range_max=3072  # ±90° from center
+                range_min=1024,
+                range_max=3072,  # ±90° from center
             )
         }
         lo, hi = read_joint_limits(robot)
@@ -327,8 +330,7 @@ class TestReadJointLimits:
         robot = MagicMock()
         # Symmetric ±90°: 1024..3072 around centre 2048
         robot.calibration = {
-            name: self._make_mock_cal_entry(1024, 3072)
-            for name in SO101_JOINT_NAMES
+            name: self._make_mock_cal_entry(1024, 3072) for name in SO101_JOINT_NAMES
         }
         lo, hi = read_joint_limits(robot)
         # Cal gives ±90°, but limits are intersected with hardcoded floor.
@@ -436,8 +438,10 @@ def test_step_execute_tight_no_longer_raises_not_implemented(tmp_path: Any) -> N
     session._ckpt_kind = "dreamerv3"
 
     # Patch _execute_dreamerv3_loop to avoid real hardware calls.
-    with patch.object(session, "_execute_dreamerv3_loop") as mock_loop, \
-         patch.object(session, "_confirm"):
+    with (
+        patch.object(session, "_execute_dreamerv3_loop") as mock_loop,
+        patch.object(session, "_confirm"),
+    ):
         session.step_execute_tight()
         # Must be called exactly once with the tight parameters.
         mock_loop.assert_called_once_with(
@@ -474,8 +478,10 @@ def test_step_execute_loose_no_longer_raises_not_implemented(tmp_path: Any) -> N
     session = DeploySession(cfg)
     session._ckpt_kind = "dreamerv3"
 
-    with patch.object(session, "_execute_dreamerv3_loop") as mock_loop, \
-         patch.object(session, "_confirm"):
+    with (
+        patch.object(session, "_execute_dreamerv3_loop") as mock_loop,
+        patch.object(session, "_confirm"),
+    ):
         session.step_execute_loose()
         mock_loop.assert_called_once_with(
             duration_s=cfg.duration_loose_s,
@@ -512,6 +518,7 @@ def test_compute_targets_rejects_nan_action() -> None:
 
 def test_read_joint_limits_never_wider_than_hardcoded_floor() -> None:
     """Symmetric cal returning ±180° must not weaken the ±90° safety floor."""
+
     class _MockCal:
         def __init__(self, mn: int, mx: int) -> None:
             self.range_min = mn
@@ -520,9 +527,7 @@ def test_read_joint_limits_never_wider_than_hardcoded_floor() -> None:
     class _MockRobot:
         def __init__(self) -> None:
             # Cal that would imply ±180° if used naively (ticks 0..4095)
-            self.calibration = {
-                n: _MockCal(0, 4095) for n in SO101_JOINT_NAMES
-            }
+            self.calibration = {n: _MockCal(0, 4095) for n in SO101_JOINT_NAMES}
 
     lo, hi = read_joint_limits(_MockRobot())
     # Cal-derived MUST be INSIDE the hardcoded floor (subset).
@@ -571,3 +576,64 @@ def test_ramped_home_terminates_when_close() -> None:
     # Should return immediately because already at home (no writes needed)
     assert elapsed < 0.5
     assert len(robot.bus.writes) == 0  # no step needed
+
+
+# ---------------------------------------------------------------------------
+# Empty cal-vs-floor intersection (fixed 2026-09-11)
+#
+# The existing test above covers a cal that is too WIDE. This covers one that is
+# entirely OUTSIDE the floor, where the intersection is empty and the maximum/
+# minimum pair comes out inverted (min > max). np.clip(x, lo, hi) with lo > hi
+# returns hi, so a span entirely BELOW the floor pinned the joint to a target
+# outside it. A span entirely ABOVE happened to pin to the floor max and was
+# safe, which is why this survived the "never wider than the floor" test.
+# ---------------------------------------------------------------------------
+
+
+class _OneCal:
+    def __init__(self, mn: int, mx: int) -> None:
+        self.range_min = mn
+        self.range_max = mx
+
+
+class _OneRobot:
+    def __init__(self, name: str, mn: int, mx: int) -> None:
+        self.calibration = {name: _OneCal(mn, mx)}
+
+
+def test_cal_entirely_below_floor_does_not_invert() -> None:
+    lo, hi = read_joint_limits(_OneRobot("shoulder_pan", 400, 800))  # ~-145..-110 deg
+    assert (lo <= hi).all(), f"inverted range leaked: lo={lo} hi={hi}"
+
+
+def test_cal_entirely_above_floor_does_not_invert() -> None:
+    lo, hi = read_joint_limits(_OneRobot("shoulder_pan", 3200, 3600))  # ~101..136 deg
+    assert (lo <= hi).all(), f"inverted range leaked: lo={lo} hi={hi}"
+
+
+def test_empty_intersection_falls_back_to_the_floor() -> None:
+    i = SO101_JOINT_NAMES.index("shoulder_pan")
+    lo, hi = read_joint_limits(_OneRobot("shoulder_pan", 400, 800))
+    assert lo[i] == _DEFAULT_JOINT_LIMITS_MIN[i]
+    assert hi[i] == _DEFAULT_JOINT_LIMITS_MAX[i]
+
+
+def test_below_floor_cal_no_longer_escapes_the_floor() -> None:
+    """The reported failure: np.clip against an inverted pair pinned outside the floor."""
+    i = SO101_JOINT_NAMES.index("shoulder_pan")
+    lo, hi = read_joint_limits(_OneRobot("shoulder_pan", 400, 800))
+    clipped = float(np.clip(-120.0, lo[i], hi[i]))
+    assert _DEFAULT_JOINT_LIMITS_MIN[i] <= clipped <= _DEFAULT_JOINT_LIMITS_MAX[i], (
+        f"target {clipped} escaped the floor "
+        f"[{_DEFAULT_JOINT_LIMITS_MIN[i]}, {_DEFAULT_JOINT_LIMITS_MAX[i]}]"
+    )
+
+
+def test_other_joints_are_untouched_by_one_bad_calibration() -> None:
+    """A single irreconcilable joint must not disturb the rest."""
+    lo, hi = read_joint_limits(_OneRobot("shoulder_pan", 400, 800))
+    for j, name in enumerate(SO101_JOINT_NAMES):
+        if name == "shoulder_pan":
+            continue
+        assert lo[j] == _DEFAULT_JOINT_LIMITS_MIN[j]
+        assert hi[j] == _DEFAULT_JOINT_LIMITS_MAX[j]
