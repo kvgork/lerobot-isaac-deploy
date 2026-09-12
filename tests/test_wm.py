@@ -54,13 +54,19 @@ def test_load_lewm_always_raises(tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_session_refuses_dreamerv3_with_hint(tmp_path) -> None:
+def test_session_dreamerv3_preflight_skipped_for_wm_kind(tmp_path) -> None:
+    """DreamerV3 ckpts skip the LeRobot runner preflight (step_preflight short-circuits
+    on _ckpt_kind != "lerobot"). Without --dry-run-loop or --execute the session exits
+    cleanly with rc=0. Verification-loop regression fix (2026-05-22) — previously the
+    test asserted rc=1 because step_preflight blindly called robot-data-run-check.
+    The supported smoke route is --mock-hardware; see docs/world-model-deploy.md.
+    """
     ckpt = _make_dreamer_ckpt(tmp_path)
     ds = tmp_path / "dataset"
     ds.mkdir()
     sess = DeploySession(SessionConfig(policy_path=ckpt, dataset_root=ds))
     rc = sess.run()
-    assert rc == 1  # gate raises RuntimeError → caught as rc=1
+    assert rc == 0
 
 
 def test_session_refuses_lewm_with_hint(tmp_path) -> None:

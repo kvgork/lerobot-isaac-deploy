@@ -6,11 +6,29 @@ shortcuts that mirror the bash scripts they replace.
 
 from __future__ import annotations
 
-import argparse
+import logging
+import os
 import sys
 
 
+def _quiet_hf_hub() -> None:
+    """Force HF offline + drop request logs BEFORE any lerobot/hf_hub import.
+
+    The SmolVLM2 backbone is already cached for deploy, but huggingface_hub
+    HEAD/GETs the hub on every policy load (log flood + latency). Setting these
+    env vars here — before DeploySession imports lerobot, and before the
+    robot-data-run subprocess inherits os.environ — stops the requests. The
+    subprocess reads HF_HUB_OFFLINE at its own startup. Override: HF_HUB_OFFLINE=0.
+    """
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    for name in ("httpx", "huggingface_hub", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def session_main(argv: list[str] | None = None) -> int:
+    _quiet_hf_hub()
     from lerobot_isaac_deploy.session import (
         DeploySession,
         build_session_parser,
@@ -84,10 +102,47 @@ def bootstrap_main(argv: list[str] | None = None) -> int:
     return _bootstrap(argv)
 
 
+def sync_wm_main(argv: list[str] | None = None) -> int:
+    """`li-deploy-sync-wm` — push a sheeprl WM checkpoint to the laptop.
+
+    Stages the sheeprl run dir into the deploy-format layout that
+    ``detect_policy_kind`` recognises as ``dreamerv3``
+    (``<root>/.hydra/config.yaml`` + ``<root>/checkpoint/ckpt_*.ckpt``)
+    and rsyncs the staged tree to ``<laptop_base>/checkpoints/wm/<label>/``.
+    """
+    from pathlib import Path
+    from lerobot_isaac_deploy.sync import build_sync_wm_parser, sync_wm_ckpt_to_laptop
+
+    ns = build_sync_wm_parser().parse_args(argv)
+    return sync_wm_ckpt_to_laptop(
+        Path(ns.sheeprl_run_dir),
+        hydra_cfg_dir=Path(ns.hydra_cfg_dir),
+        host=ns.host,
+        laptop_base=ns.laptop_base,
+        remote_dir=ns.remote_dir,
+        label=ns.label,
+        metadata_files=[Path(p) for p in ns.metadata] if ns.metadata else None,
+        stage_dir=Path(ns.stage_dir) if ns.stage_dir else None,
+        dry_run=ns.dry_run,
+    )
+
+
 def wm_rollout_main(argv: list[str] | None = None) -> int:
     from lerobot_isaac_deploy.wm_rollout import main as _rollout
 
     return _rollout(argv)
+
+
+def wm_dryrun_main(argv: list[str] | None = None) -> int:
+    """`lerobot-isaac-deploy wm-dryrun` — dry-run DreamerV3 actor on synthetic obs.
+
+    Loads a sheeprl checkpoint, feeds N random observations through the actor,
+    prints per-joint action statistics, and writes a report.json.
+    No hardware, no camera, no serial port required.
+    """
+    from lerobot_isaac_deploy.wm_dryrun import main as _dryrun
+
+    return _dryrun(argv)
 
 
 def kind_main(argv: list[str] | None = None) -> int:
@@ -110,8 +165,10 @@ def kind_main(argv: list[str] | None = None) -> int:
 _SUBCOMMANDS = {
     "session":    (session_main,    "Run the confirm-gated deploy ladder (LeRobot or DreamerV3-actor)"),
     "wm-rollout": (wm_rollout_main, "Offline state-prediction rollout (DreamerV3 / LeWM); no robot"),
+    "wm-dryrun":  (wm_dryrun_main,  "DreamerV3 actor dry-run: load ckpt + run N synthetic obs; no robot"),
     "kind":       (kind_main,       "Detect what kind of checkpoint a directory holds"),
     "sync-ckpt":  (sync_ckpt_main,  "Desktop → laptop ckpt sync (run on desktop)"),
+    "sync-wm":    (sync_wm_main,    "Desktop → laptop world-model ckpt sync (run on desktop)"),
     "sync-eval":  (sync_eval_main,  "Laptop → desktop eval JSON pull (run on desktop)"),
     "bootstrap":  (bootstrap_main,  "One-shot laptop env setup"),
 }

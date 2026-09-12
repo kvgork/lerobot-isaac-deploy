@@ -51,6 +51,21 @@ def pip_install_runtime(
     return subprocess.run(args, check=False).returncode
 
 
+def pip_install_dreamerv3() -> int:
+    """Install sheeprl from git master (PyPI wheels pin python<3.12).
+
+    Required only when a DreamerV3 ckpt is being deployed. Skipped by
+    default — call explicitly via `--with-dreamerv3` on `li-deploy-bootstrap`.
+    """
+    args = [
+        sys.executable, "-m", "pip", "install",
+        "--ignore-requires-python",
+        "sheeprl @ git+https://github.com/Eclectic-Sheep/sheeprl.git",
+    ]
+    print(f"[bootstrap] {' '.join(args)}")
+    return subprocess.run(args, check=False).returncode
+
+
 def prefetch_smolvlm2() -> int:
     """Download the SmolVLM2-500M backbone into ~/.cache/huggingface/hub/."""
     cache_marker = (
@@ -98,6 +113,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="skip pip install (use when env is managed by pixi/conda)")
     p.add_argument("--skip-prefetch", action="store_true",
                    help="skip SmolVLM2 weight prefetch")
+    p.add_argument("--with-dreamerv3", action="store_true",
+                   help="install sheeprl (from git master, "
+                        "--ignore-requires-python on Py3.12) for "
+                        "DreamerV3 ckpt deploy")
     p.add_argument("--lerobot-version", default=DEFAULT_LEROBOT_VERSION)
     ns = p.parse_args(argv)
 
@@ -106,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not ns.skip_pip:
         rc = pip_install_runtime(lerobot_version=ns.lerobot_version)
+        if rc != 0:
+            return rc
+    if ns.with_dreamerv3:
+        rc = pip_install_dreamerv3()
         if rc != 0:
             return rc
     if not ns.skip_prefetch:

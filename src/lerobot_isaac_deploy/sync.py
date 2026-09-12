@@ -255,6 +255,142 @@ def sync_ckpt_to_laptop(
 
 
 # --------------------------------------------------------------------------- #
+# desktop → laptop: world-model checkpoint shipping
+# --------------------------------------------------------------------------- #
+
+
+def _stage_wm_ckpt(
+    run_dir: Path, hydra_cfg_dir: Path, stage_dir: Path
+) -> tuple[Path, Path]:
+    """Stage a sheeprl run dir into the deploy-format layout the laptop
+    expects: ``<stage>/.hydra/config.yaml`` + ``<stage>/checkpoint/ckpt_*.ckpt``.
+
+    sheeprl writes ckpts under
+    ``logs/runs/<algo>/<env>/<run_name>/version_*/checkpoint/ckpt_*.ckpt``
+    while ``detect_policy_kind`` expects ``.hydra/config.yaml`` co-located
+    with the ckpt. This staging is idempotent — caller may rerun safely.
+
+    Returns
+    -------
+    (staged_ckpt_path, staged_config_yaml)
+        Absolute paths under ``stage_dir``.
+    """
+    ckpts = sorted(run_dir.glob("version_*/checkpoint/ckpt_*.ckpt"))
+    if not ckpts:
+        raise FileNotFoundError(
+            f"no ckpt_*.ckpt under {run_dir} — sheeprl must save at least "
+            f"one checkpoint before sync. Set checkpoint.every to a value "
+            f"≤ algo.total_steps in the training cmd."
+        )
+    src_ckpt = ckpts[-1]  # highest step
+
+    cfg_src = hydra_cfg_dir / "config.yaml"
+    if not cfg_src.is_file():
+        raise FileNotFoundError(
+            f"hydra config.yaml missing at {cfg_src}. Pass --hydra-cfg-dir "
+            f"pointing at the Hydra run dir for this trial."
+        )
+
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    (stage_dir / ".hydra").mkdir(exist_ok=True)
+    (stage_dir / "checkpoint").mkdir(exist_ok=True)
+
+    import shutil
+    shutil.copy2(cfg_src, stage_dir / ".hydra" / "config.yaml")
+    dst_ckpt = stage_dir / "checkpoint" / src_ckpt.name
+    if not dst_ckpt.exists() or src_ckpt.stat().st_mtime > dst_ckpt.stat().st_mtime:
+        shutil.copy2(src_ckpt, dst_ckpt)
+    return dst_ckpt, stage_dir / ".hydra" / "config.yaml"
+
+
+def sync_wm_ckpt_to_laptop(
+    sheeprl_run_dir: Path,
+    *,
+    hydra_cfg_dir: Path,
+    host: str = DEFAULT_LAPTOP_HOST,
+    laptop_base: str = DEFAULT_LAPTOP_BASE,
+    remote_dir: str | None = None,
+    label: str | None = None,
+    metadata_files: list[Path] | None = None,
+    dry_run: bool = False,
+    stage_dir: Path | None = None,
+) -> int:
+    """Stage + ship a sheeprl world-model checkpoint to the laptop.
+
+    Layout on the laptop after sync (matches ``detect_policy_kind``'s
+    DreamerV3 contract):
+
+        <laptop_base>/checkpoints/wm/<label>/
+            .hydra/config.yaml
+            checkpoint/ckpt_<step>_<rank>.ckpt
+            best.json                                (if provided)
+            eval_rollout.json                        (if provided)
+
+    Parameters
+    ----------
+    sheeprl_run_dir
+        ``logs/runs/<algo>/<env>/<run_name>/`` — sheeprl-managed dir
+        containing ``version_*/checkpoint/ckpt_*.ckpt``.
+    hydra_cfg_dir
+        Dir holding the Hydra ``config.yaml`` (training-time
+        ``hydra.run.dir``). Required because sheeprl writes ckpts and
+        Hydra config to DIFFERENT roots.
+    host
+        SSH alias for the laptop.
+    laptop_base
+        Base path on the laptop. Ignored when ``remote_dir`` is set.
+    remote_dir
+        EXACT destination dir; overrides the auto-generated
+        ``<laptop_base>/checkpoints/wm/<label>/`` path.
+    label
+        Subdir name on the laptop. Defaults to ``sheeprl_run_dir.name``.
+    metadata_files
+        Extra JSON files (best.json, eval_rollout.json, …) to ship into
+        the staged dir.
+    dry_run
+        Pass ``--dry-run`` to rsync and skip the SSH mkdir.
+    stage_dir
+        Where to stage the deploy-format layout BEFORE rsync. Default:
+        ``outputs/wm_for_laptop/<label>/``.
+
+    Returns
+    -------
+    rsync exit code (0 = success).
+    """
+    sheeprl_run_dir = Path(sheeprl_run_dir).resolve()
+    hydra_cfg_dir = Path(hydra_cfg_dir).resolve()
+    if not sheeprl_run_dir.is_dir():
+        raise FileNotFoundError(f"sheeprl run dir not found: {sheeprl_run_dir}")
+    if not hydra_cfg_dir.is_dir():
+        raise FileNotFoundError(f"hydra cfg dir not found: {hydra_cfg_dir}")
+
+    label = label or sheeprl_run_dir.name
+    if stage_dir is None:
+        stage_dir = Path("outputs/wm_for_laptop") / label
+    stage_dir = Path(stage_dir).resolve()
+
+    _stage_wm_ckpt(sheeprl_run_dir, hydra_cfg_dir, stage_dir)
+
+    if metadata_files:
+        import shutil
+        for meta_src in metadata_files:
+            meta_src = Path(meta_src)
+            if meta_src.is_file():
+                shutil.copy2(meta_src, stage_dir / meta_src.name)
+
+    if remote_dir is not None:
+        remote_base_path = remote_dir.rstrip("/")
+    else:
+        remote_base_path = f"{laptop_base.rstrip('/')}/checkpoints/wm/{label}"
+    dst = f"{host}:{remote_base_path}/"
+
+    rc = _ensure_remote_dir(host, remote_base_path, dry_run=dry_run)
+    if rc != 0:
+        return rc
+    return _run_rsync(f"{stage_dir}/", dst, dry_run=dry_run)
+
+
+# --------------------------------------------------------------------------- #
 # laptop → desktop: eval JSON pull
 # --------------------------------------------------------------------------- #
 
@@ -321,5 +457,55 @@ def build_sync_eval_parser() -> argparse.ArgumentParser:
     p.add_argument("--desktop-eval-dir", default="outputs/eval/")
     p.add_argument("--host", default=DEFAULT_LAPTOP_HOST)
     p.add_argument("--laptop-eval-dir", default="~/outputs/eval/")
+    p.add_argument("--dry-run", action="store_true")
+    return p
+
+
+def build_sync_wm_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="li-deploy-sync-wm",
+        description="desktop → laptop world-model checkpoint sync "
+                    "(stages sheeprl run dir into deploy-format layout)",
+    )
+    p.add_argument(
+        "--sheeprl-run-dir",
+        required=True,
+        help="logs/runs/<algo>/<env>/<run_name>/ dir containing "
+             "version_*/checkpoint/ckpt_*.ckpt",
+    )
+    p.add_argument(
+        "--hydra-cfg-dir",
+        required=True,
+        help="Hydra working dir holding config.yaml. For an autoresearch "
+             "trial this is `outputs/autoresearch-<slug>/trial_<i>/.hydra/`.",
+    )
+    p.add_argument("--host", default=DEFAULT_LAPTOP_HOST)
+    p.add_argument(
+        "--laptop-base",
+        default=DEFAULT_LAPTOP_BASE,
+        help=f"base path on the remote (default: {DEFAULT_LAPTOP_BASE})",
+    )
+    p.add_argument(
+        "--remote-dir",
+        help="EXACT destination dir (overrides --laptop-base + the auto "
+             "`/checkpoints/wm/<label>/` suffix). For external drives.",
+    )
+    p.add_argument(
+        "--label",
+        help="subdir name on the laptop (default: sheeprl run dir basename)",
+    )
+    p.add_argument(
+        "--metadata",
+        action="append",
+        default=[],
+        help="extra JSON file to ship next to the ckpt (repeatable). "
+             "Typical: best.json + eval_rollout.json from the autoresearch "
+             "state dir.",
+    )
+    p.add_argument(
+        "--stage-dir",
+        help="where to stage the deploy-format layout before rsync "
+             "(default: outputs/wm_for_laptop/<label>/)",
+    )
     p.add_argument("--dry-run", action="store_true")
     return p

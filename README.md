@@ -52,6 +52,22 @@ pixi run sync-eval
 pixi run test
 ```
 
+## Deploying world models
+
+This package supports three categories of world-model checkpoints on the
+SO-101 arm:
+
+| Kind        | Closed-loop on arm | Offline rollout | Notes |
+|-------------|--------------------|-----------------|-------|
+| DreamerV3   | yes (actor head)   | yes             | sheeprl ckpt layout; full doc: `docs/world-model-deploy.md` |
+| LeWM        | no (no actor)      | yes             | offline only; needs `h5py` + `stable-worldmodel` / `le-wm` |
+| V-JEPA / Cosmos / GAIA | no       | no              | detection only — refuses with a hint; research-phase only |
+
+Real-arm motor writes against a *synthetic test fixture* are blocked by
+`--require-real-ckpt` (or the env var `LI_DEPLOY_REQUIRE_REAL_CKPT=1`).
+
+Full reference: [`docs/world-model-deploy.md`](docs/world-model-deploy.md).
+
 ## Smoke test without hardware
 
 Verify the checkpoint actually loads and emits actions on this machine

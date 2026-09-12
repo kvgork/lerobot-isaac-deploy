@@ -1376,7 +1376,7 @@ packages:
 - pypi: ./
   name: lerobot-isaac-deploy
   version: 0.1.0
-  sha256: 03d4c7a32d605aaa178e311f1e6cd491753a19ce6f2bfc63902065b9d3a7f21c
+  sha256: 3a1b87ae221b4dbdc61212e97520252025cc10493859d7854d1c4943fd8f20d2
   requires_dist:
   - numpy>=1.24
   - pyyaml>=6
