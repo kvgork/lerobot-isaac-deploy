@@ -3,12 +3,12 @@
 All tests use the synthetic-marker short-circuit so torch/sheeprl are
 not required in CI environments.
 """
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from lerobot_isaac_deploy.wm_dryrun import build_dryrun_parser, run_dryrun
@@ -120,14 +120,22 @@ def test_dryrun_parser_defaults() -> None:
 
 
 def test_dryrun_parser_explicit_args() -> None:
-    ns = build_dryrun_parser().parse_args([
-        "--policy-path", "/tmp/ckpt",
-        "--n-samples", "50",
-        "--device", "cuda",
-        "--state-dim", "6",
-        "--image-size", "96",
-        "--seed", "7",
-    ])
+    ns = build_dryrun_parser().parse_args(
+        [
+            "--policy-path",
+            "/tmp/ckpt",
+            "--n-samples",
+            "50",
+            "--device",
+            "cuda",
+            "--state-dim",
+            "6",
+            "--image-size",
+            "96",
+            "--seed",
+            "7",
+        ]
+    )
     assert ns.n_samples == 50
     assert ns.device == "cuda"
     assert ns.state_dim == 6
@@ -155,11 +163,35 @@ def test_cli_wm_dryrun_synthetic_exit_0(tmp_path: Path) -> None:
     from lerobot_isaac_deploy.cli import main as cli_main
 
     ckpt = _make_synthetic_ckpt(tmp_path)
-    rc = cli_main([
-        "wm-dryrun",
-        "--policy-path", str(ckpt),
-        "--n-samples", "5",
-        "--output-dir", str(tmp_path / "out"),
-    ])
+    rc = cli_main(
+        [
+            "wm-dryrun",
+            "--policy-path",
+            str(ckpt),
+            "--n-samples",
+            "5",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
     assert rc == 0
     assert (tmp_path / "out" / "report.json").is_file()
+
+
+def test_missing_ckpt_raises_without_needing_torch(tmp_path: Path) -> None:
+    """The path check must not require a backend.
+
+    Before 2026-09-12 this surfaced as `ModuleNotFoundError: torch` in any env
+    without torch, because run_dryrun imported the loader before validating the
+    path. The complaint is the path; detecting it needs no backend.
+    """
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        run_dryrun(tmp_path / "nope.ckpt", n_samples=1, output_dir=tmp_path / "out")
+
+
+def test_missing_ckpt_does_not_create_an_output_dir(tmp_path: Path) -> None:
+    """A failed call must not leave a stray empty outputs/ directory behind."""
+    out = tmp_path / "out"
+    with pytest.raises(FileNotFoundError):
+        run_dryrun(tmp_path / "nope.ckpt", n_samples=1, output_dir=out)
+    assert not out.exists(), "output dir created despite the checkpoint being missing"

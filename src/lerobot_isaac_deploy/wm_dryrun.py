@@ -78,9 +78,17 @@ def run_dryrun(
     dict
         Report dict also written to ``output_dir/report.json``.
     """
+    cp = Path(checkpoint_path)
+    # Validate the cheap precondition FIRST, before importing a heavy backend and
+    # before creating any output directory. Previously a non-existent checkpoint
+    # surfaced as `ModuleNotFoundError: torch` on a machine without torch (the real
+    # complaint is the path, and it needs no backend to detect), and left an empty
+    # `outputs/wm-dryrun-<ts>/` behind on every failed call.
+    if not cp.exists():
+        raise FileNotFoundError(f"checkpoint path does not exist: {cp}")
+
     from lerobot_isaac_deploy.wm_loader import load_dreamerv3, _SyntheticActor
 
-    cp = Path(checkpoint_path)
     ts = datetime.now().strftime("%Y-%m-%dT%H%M%S")
     if output_dir is None:
         output_dir = Path("outputs") / f"wm-dryrun-{ts}"
